@@ -11,6 +11,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from collections import defaultdict
 
 from models.encoder import MinigridEncoder
@@ -170,9 +171,14 @@ class HRLTrainer:
         return tau
 
     def _compute_intrinsic_reward(self, obs_features, goal):
-        """Worker's intrinsic reward: negative distance to goal in latent space."""
-        projected = self.goal_projection(obs_features)
-        return -torch.norm(projected - goal, dim=-1)
+        """Worker's intrinsic reward: negative distance to goal in latent space.
+
+        Both vectors are L2-normalized before computing distance,
+        bounding the reward to [-2, 0] regardless of scale.
+        """
+        projected = F.normalize(self.goal_projection(obs_features), dim=-1)
+        goal_norm = F.normalize(goal, dim=-1)
+        return -torch.norm(projected - goal_norm, dim=-1)
 
     def collect_rollout_flat(self):
         """Collect rollout data for flat PPO baseline."""
