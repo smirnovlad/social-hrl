@@ -1,0 +1,60 @@
+# Environment
+env:
+  name: "MiniGrid-KeyCorridorS3R2-v0"  # Start simpler, scale up
+  max_steps: 500
+  fully_observable: false  # partial observability (7x7 agent view)
+
+# Architecture
+encoder:
+  channels: [16, 32, 64]
+  hidden_dim: 128
+
+manager:
+  goal_dim: 16
+  hidden_dim: 128
+  goal_period: 10  # c = manager acts every 10 steps
+
+worker:
+  hidden_dim: 128
+  intrinsic_reward_coef: 1.0
+  extrinsic_reward_coef: 1.0
+
+communication:
+  vocab_size: 10  # K
+  message_length: 3  # L
+  tau_start: 1.0  # Gumbel-Softmax temperature
+  tau_end: 0.1
+  tau_anneal_steps: 200000
+
+# PPO
+ppo:
+  lr: 3e-4
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_eps: 0.2
+  entropy_coef: 0.01
+  value_coef: 0.5
+  max_grad_norm: 0.5
+  num_envs: 8
+  num_steps: 128  # steps per rollout
+  num_minibatches: 4
+  update_epochs: 4
+  total_timesteps: 1000000
+  anneal_lr: true
+
+# Multi-agent
+multi_agent:
+  num_agents: 2
+  shared_critic: true
+  comm_reward_coef: 0.1  # bonus for successful coordination
+
+# Experiment
+experiment:
+  seed: 42
+  device: "cuda"
+  log_interval: 10
+  save_interval: 100000
+  eval_episodes: 20
+  wandb_project: "social-hrl"
+  wandb_entity: null
+  output_dir: "outputs"
