@@ -16,11 +16,11 @@ Needs: install dependencies, debug runtime, run experiments.
 
 ## Phase 2: Experiment 0 — Baselines (~100K steps each)
 
-- [ ] Run flat PPO: `python scripts/train.py --mode flat --seed 42 --total-timesteps 100000`
-- [ ] Run HRL continuous: `python scripts/train.py --mode continuous --seed 42 --total-timesteps 100000`
-- [ ] Verify flat PPO does NOT easily solve the task (if it does, switch to harder env like `MiniGrid-KeyCorridorS4R3-v0`)
-- [ ] Verify HRL agent converges (worker intrinsic reward improves, then extrinsic reward improves)
-- [ ] Verify goal collapse happens in continuous mode (check goal entropy in metrics.json — low entropy = collapse)
+- [x] Run flat PPO: `python scripts/train.py --mode flat --seed 42 --total-timesteps 100000`
+- [x] Run HRL continuous: `python scripts/train.py --mode continuous --seed 42 --total-timesteps 100000`
+- [x] Verify flat PPO does NOT easily solve the task (if it does, switch to harder env like `MiniGrid-KeyCorridorS4R3-v0`)
+- [x] Verify HRL agent converges (worker intrinsic reward improves, then extrinsic reward improves)
+- [x] Verify goal collapse happens in continuous mode (check goal entropy in metrics.json — low entropy = collapse)
 
 ## Phase 3: Experiment 1 — Three-Way Comparison (1M steps × 3 seeds)
 
