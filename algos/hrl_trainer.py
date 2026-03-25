@@ -256,7 +256,7 @@ class HRLTrainer:
                     self.clip_eps, self.entropy_coef, self.value_coef, self.max_grad_norm
                 )
                 for k, v in stats.items():
-                    all_stats[k].append(v)
+                    all_stats[f'worker_{k}'].append(v)
         return {k: np.mean(v) for k, v in all_stats.items()}
 
     # ------------------------------------------------------------------
@@ -592,7 +592,7 @@ class HRLTrainer:
                       f"Step {self.global_step} | "
                       f"Mean Return: {mean_return:.2f} | "
                       f"SPS: {sps:.0f} | "
-                      f"Loss: {stats.get('loss', stats.get('worker_loss', 0)):.4f}")
+                      f"Loss: {stats.get('worker_loss', 0):.4f}")
 
                 if wandb_run is not None:
                     log_data = {
