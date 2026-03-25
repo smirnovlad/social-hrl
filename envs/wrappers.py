@@ -1,6 +1,7 @@
 """Environment wrappers for Minigrid."""
 
 import gymnasium as gym
+import minigrid  # noqa: F401 — registers MiniGrid envs with gymnasium
 import numpy as np
 
 

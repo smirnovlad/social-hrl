@@ -56,12 +56,6 @@ class HRLTrainer:
     """Training loop for single-agent HRL experiments."""
 
     def __init__(self, config, mode='continuous', device='cuda'):
-        """
-        Args:
-            config: Dict of hyperparameters (from default.yaml).
-            mode: 'flat', 'continuous', or 'discrete'.
-            device: 'cuda' or 'cpu'.
-        """
         self.config = config
         self.mode = mode
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
@@ -86,7 +80,9 @@ class HRLTrainer:
         if mode == 'flat':
             self.flat_policy = FlatPolicy(obs_shape, num_actions,
                                           config['encoder']['hidden_dim']).to(self.device)
-            params = self.flat_policy.parameters()
+            self.optimizer = torch.optim.Adam(
+                self.flat_policy.parameters(), lr=ppo_cfg['lr'], eps=1e-5
+            )
         else:
             self.encoder = MinigridEncoder(
                 obs_shape,
@@ -107,9 +103,18 @@ class HRLTrainer:
                 hidden_dim=config['worker']['hidden_dim'],
             ).to(self.device)
 
-            params = list(self.encoder.parameters()) + \
-                     list(self.manager.parameters()) + \
-                     list(self.worker.parameters())
+            # Projection from encoder features to goal space for intrinsic reward
+            self.goal_projection = nn.Linear(
+                config['encoder']['hidden_dim'],
+                config['manager']['goal_dim'],
+            ).to(self.device)
+
+            worker_params = (
+                list(self.encoder.parameters()) +
+                list(self.worker.parameters()) +
+                list(self.goal_projection.parameters())
+            )
+            manager_params = list(self.manager.parameters())
 
             if mode == 'discrete':
                 comm_cfg = config['communication']
@@ -119,13 +124,19 @@ class HRLTrainer:
                     message_length=comm_cfg['message_length'],
                     tau=comm_cfg['tau_start'],
                 ).to(self.device)
-                params += list(self.comm_channel.parameters())
+                # Comm channel is part of the goal pipeline — add to worker optimizer
+                worker_params += list(self.comm_channel.parameters())
 
                 self.tau_start = comm_cfg['tau_start']
                 self.tau_end = comm_cfg['tau_end']
                 self.tau_anneal_steps = comm_cfg['tau_anneal_steps']
 
-        self.optimizer = torch.optim.Adam(params, lr=ppo_cfg['lr'], eps=1e-5)
+            self.worker_optimizer = torch.optim.Adam(
+                worker_params, lr=ppo_cfg['lr'], eps=1e-5
+            )
+            self.manager_optimizer = torch.optim.Adam(
+                manager_params, lr=ppo_cfg['lr'], eps=1e-5
+            )
 
         # PPO config
         self.gamma = ppo_cfg['gamma']
@@ -156,7 +167,8 @@ class HRLTrainer:
 
     def _compute_intrinsic_reward(self, obs_features, goal):
         """Worker's intrinsic reward: negative distance to goal in latent space."""
-        return -torch.norm(obs_features - goal, dim=-1)
+        projected = self.goal_projection(obs_features)
+        return -torch.norm(projected - goal, dim=-1)
 
     def collect_rollout_flat(self):
         """Collect rollout data for flat PPO baseline."""
@@ -229,14 +241,13 @@ class HRLTrainer:
         w_done_buf = torch.zeros(T, N).to(self.device)
         w_val_buf = torch.zeros(T, N).to(self.device)
 
-        # Manager buffers (sparser - every c steps)
-        manager_steps = []
-        m_feat_buf = []
-        m_goal_buf = []
-        m_logp_buf = []
-        m_rew_buf = []
-        m_done_buf = []
-        m_val_buf = []
+        # Manager buffers — per-environment to keep trajectories separate
+        m_feat_buf = [[] for _ in range(N)]
+        m_goal_buf = [[] for _ in range(N)]
+        m_logp_buf = [[] for _ in range(N)]
+        m_rew_buf = [[] for _ in range(N)]
+        m_done_buf = [[] for _ in range(N)]
+        m_val_buf = [[] for _ in range(N)]
 
         # Message tracking for analysis
         messages_log = [] if self.mode == 'discrete' else None
@@ -271,7 +282,6 @@ class HRLTrainer:
                         msg_onehot, msg_indices, msg_logits = self.comm_channel.encode(goal)
                         decoded_goal = self.comm_channel.decode(msg_onehot)
 
-                    # For envs that need new goals, use decoded
                     new_goal = torch.where(
                         needs_new_goal.unsqueeze(-1).expand_as(decoded_goal),
                         decoded_goal, current_goal
@@ -285,16 +295,15 @@ class HRLTrainer:
                         goal, current_goal
                     )
 
-                # Log manager data for envs that set new goals
+                # Log manager data per-environment
                 for i in range(N):
                     if needs_new_goal[i]:
-                        manager_steps.append(step)
-                        m_feat_buf.append(features[i])
-                        m_goal_buf.append(goal[i])
-                        m_logp_buf.append(log_prob[i])
-                        m_val_buf.append(value[i])
-                        m_rew_buf.append(manager_extrinsic_reward[i].clone())
-                        m_done_buf.append(torch.tensor(0.0))
+                        m_feat_buf[i].append(features[i])
+                        m_goal_buf[i].append(goal[i])
+                        m_logp_buf[i].append(log_prob[i])
+                        m_val_buf[i].append(value[i])
+                        m_rew_buf[i].append(manager_extrinsic_reward[i].clone())
+                        m_done_buf[i].append(torch.tensor(0.0, device=self.device))
                         manager_extrinsic_reward[i] = 0.0
 
                 current_goal = new_goal
@@ -320,7 +329,8 @@ class HRLTrainer:
             next_obs_t = torch.from_numpy(next_obs).to(self.device)
             with torch.no_grad():
                 next_features = self.encoder(next_obs_t)
-            intrinsic_reward = self._compute_intrinsic_reward(next_features, current_goal)
+            with torch.no_grad():
+                intrinsic_reward = self._compute_intrinsic_reward(next_features, current_goal)
             worker_reward = self.intrinsic_coef * intrinsic_reward + self.extrinsic_coef * reward_t
 
             w_rew_buf[step] = worker_reward
@@ -336,9 +346,13 @@ class HRLTrainer:
                     episode_rewards[i] = 0
                     steps_since_goal[i] = 0
                     manager_extrinsic_reward[i] = 0
+                    # Mark episode boundary in manager buffer
+                    if m_done_buf[i]:
+                        m_done_buf[i][-1] = torch.tensor(1.0, device=self.device)
 
             steps_since_goal += 1
             obs = next_obs_t
+            self.global_step += self.num_envs
 
         # Bootstrap worker value
         with torch.no_grad():
@@ -350,19 +364,47 @@ class HRLTrainer:
             self.gamma, self.gae_lambda
         )
 
-        # Manager GAE (if we have enough data)
+        # Manager GAE — compute per-environment then concatenate
+        all_m_features = []
+        all_m_goals = []
+        all_m_logprobs = []
+        all_m_advantages = []
+        all_m_returns = []
+
+        for i in range(N):
+            n_events = len(m_val_buf[i])
+            if n_events < 2:
+                continue
+
+            vals = torch.stack(m_val_buf[i])       # (n_events,)
+            rews = torch.stack(m_rew_buf[i][1:])    # (n_events-1,) rewards offset by one period
+            dones = torch.stack(m_done_buf[i][1:])   # (n_events-1,)
+
+            if len(rews) == 0:
+                continue
+
+            adv, ret = compute_gae(rews, vals[:-1], dones, vals[-1],
+                                   self.gamma, self.gae_lambda)
+
+            # Align: features/goals/logprobs correspond to vals[:-1] (drop last)
+            all_m_features.append(torch.stack(m_feat_buf[i][:-1]))
+            all_m_goals.append(torch.stack(m_goal_buf[i][:-1]))
+            all_m_logprobs.append(torch.stack(m_logp_buf[i][:-1]))
+            all_m_advantages.append(adv)
+            all_m_returns.append(ret)
+
         m_advantages = None
         m_returns = None
-        if len(m_feat_buf) > 1:
-            m_val_t = torch.stack(m_val_buf)
-            m_rew_t = torch.stack(m_rew_buf[1:])  # Rewards are offset by one goal period
-            m_done_t = torch.stack(m_done_buf[1:])
+        m_features = None
+        m_goals = None
+        m_logprobs = None
 
-            if len(m_rew_t) > 0 and len(m_val_t) > 1:
-                m_advantages, m_returns = compute_gae(
-                    m_rew_t, m_val_t[:-1], m_done_t, m_val_t[-1],
-                    self.gamma, self.gae_lambda
-                )
+        if all_m_advantages:
+            m_features = torch.cat(all_m_features)
+            m_goals = torch.cat(all_m_goals)
+            m_logprobs = torch.cat(all_m_logprobs)
+            m_advantages = torch.cat(all_m_advantages)
+            m_returns = torch.cat(all_m_returns)
 
         return {
             'worker': {
@@ -375,9 +417,9 @@ class HRLTrainer:
                 'returns': w_returns.reshape(-1),
             },
             'manager': {
-                'features': torch.stack(m_feat_buf) if m_feat_buf else None,
-                'goals': torch.stack(m_goal_buf) if m_goal_buf else None,
-                'old_log_probs': torch.stack(m_logp_buf) if m_logp_buf else None,
+                'features': m_features,
+                'goals': m_goals,
+                'old_log_probs': m_logprobs,
                 'advantages': m_advantages,
                 'returns': m_returns,
             },
@@ -432,7 +474,7 @@ class HRLTrainer:
                     return self.worker.evaluate_actions(features, b['goals'], b['actions'])
 
                 stats = ppo_update(
-                    batch, worker_policy_fn, self.optimizer,
+                    batch, worker_policy_fn, self.worker_optimizer,
                     self.clip_eps, self.entropy_coef, self.value_coef, self.max_grad_norm
                 )
                 for k, v in stats.items():
@@ -464,7 +506,7 @@ class HRLTrainer:
                             )
 
                         stats = ppo_update(
-                            batch, manager_policy_fn, self.optimizer,
+                            batch, manager_policy_fn, self.manager_optimizer,
                             self.clip_eps, self.entropy_coef * 0.1, self.value_coef, self.max_grad_norm
                         )
                         for k, v in stats.items():
@@ -472,7 +514,7 @@ class HRLTrainer:
 
         return {k: np.mean(v) for k, v in all_stats.items()}
 
-    def train(self, output_dir='outputs'):
+    def train(self, output_dir='outputs', wandb_run=None):
         """Main training loop."""
         os.makedirs(output_dir, exist_ok=True)
 
@@ -488,13 +530,21 @@ class HRLTrainer:
         print(f"Device: {self.device}")
         print()
 
+        lr = self.config['ppo']['lr']
+
         for update in range(1, num_updates + 1):
             # Learning rate annealing
             if self.config['ppo']['anneal_lr']:
                 frac = 1.0 - (update - 1) / num_updates
                 lr = frac * self.config['ppo']['lr']
-                for pg in self.optimizer.param_groups:
-                    pg['lr'] = lr
+                if self.mode == 'flat':
+                    for pg in self.optimizer.param_groups:
+                        pg['lr'] = lr
+                else:
+                    for pg in self.worker_optimizer.param_groups:
+                        pg['lr'] = lr
+                    for pg in self.manager_optimizer.param_groups:
+                        pg['lr'] = lr
 
             # Collect rollout
             if self.mode == 'flat':
@@ -523,8 +573,19 @@ class HRLTrainer:
                       f"SPS: {sps:.0f} | "
                       f"Loss: {stats.get('loss', stats.get('worker_loss', 0)):.4f}")
 
+                if wandb_run is not None:
+                    log_data = {
+                        'global_step': self.global_step,
+                        'mean_return': mean_return,
+                        'sps': sps,
+                        'learning_rate': lr if self.config['ppo']['anneal_lr'] else self.config['ppo']['lr'],
+                        'episodes': len(all_returns),
+                    }
+                    log_data.update(stats)
+                    wandb_run.log(log_data, step=self.global_step)
+
             # Save checkpoint
-            if self.global_step % self.config['experiment']['save_interval'] == 0:
+            if self.global_step > 0 and self.global_step % self.config['experiment']['save_interval'] == 0:
                 self.save(os.path.join(output_dir, f'checkpoint_{self.global_step}.pt'))
 
         # Final save
@@ -545,14 +606,17 @@ class HRLTrainer:
 
         if self.mode == 'flat':
             state['flat_policy'] = self.flat_policy.state_dict()
+            state['optimizer'] = self.optimizer.state_dict()
         else:
             state['encoder'] = self.encoder.state_dict()
             state['manager'] = self.manager.state_dict()
             state['worker'] = self.worker.state_dict()
+            state['goal_projection'] = self.goal_projection.state_dict()
+            state['worker_optimizer'] = self.worker_optimizer.state_dict()
+            state['manager_optimizer'] = self.manager_optimizer.state_dict()
             if self.mode == 'discrete':
                 state['comm_channel'] = self.comm_channel.state_dict()
 
-        state['optimizer'] = self.optimizer.state_dict()
         torch.save(state, path)
         print(f"Saved checkpoint to {path}")
 
@@ -562,13 +626,17 @@ class HRLTrainer:
 
         if self.mode == 'flat':
             self.flat_policy.load_state_dict(state['flat_policy'])
+            self.optimizer.load_state_dict(state['optimizer'])
         else:
             self.encoder.load_state_dict(state['encoder'])
             self.manager.load_state_dict(state['manager'])
             self.worker.load_state_dict(state['worker'])
+            if 'goal_projection' in state:
+                self.goal_projection.load_state_dict(state['goal_projection'])
+            self.worker_optimizer.load_state_dict(state['worker_optimizer'])
+            self.manager_optimizer.load_state_dict(state['manager_optimizer'])
             if self.mode == 'discrete' and 'comm_channel' in state:
                 self.comm_channel.load_state_dict(state['comm_channel'])
 
-        self.optimizer.load_state_dict(state['optimizer'])
         self.global_step = state['global_step']
         print(f"Loaded checkpoint from {path} (step {self.global_step})")

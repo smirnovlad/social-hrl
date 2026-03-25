@@ -9,10 +9,10 @@ Needs: install dependencies, debug runtime, run experiments.
 
 ## Phase 1: Setup & Sanity (do first)
 
-- [ ] `pip install -r requirements.txt` on server with GPU
-- [ ] Run smoke test: `python scripts/train.py --mode flat --seed 42 --total-timesteps 10000`
-- [ ] Fix any import errors or runtime bugs
-- [ ] Verify Minigrid env creates and steps correctly
+- [x] `pip install -r requirements.txt` on server with GPU
+- [x] Run smoke test: `python scripts/train.py --mode flat --seed 42 --total-timesteps 10000`
+- [x] Fix any import errors or runtime bugs
+- [x] Verify Minigrid env creates and steps correctly
 
 ## Phase 2: Experiment 0 — Baselines (~100K steps each)
 

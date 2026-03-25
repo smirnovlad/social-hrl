@@ -53,5 +53,5 @@ class MinigridEncoder(nn.Module):
         # Minigrid gives (H, W, C), conv expects (C, H, W)
         if obs.dim() == 3:
             obs = obs.unsqueeze(0)
-        x = obs.permute(0, 3, 1, 2).float() / 255.0
+        x = obs.permute(0, 3, 1, 2).float() / 10.0
         return self.fc(self.conv(x))

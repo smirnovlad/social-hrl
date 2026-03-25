@@ -12,6 +12,7 @@ import sys
 import yaml
 import json
 import numpy as np
+import wandb
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -38,6 +39,8 @@ def main():
     parser.add_argument('--config', type=str, default='configs/default.yaml')
     parser.add_argument('--output-dir', type=str, default=None)
     parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--no-wandb', action='store_true',
+                        help='Disable wandb logging')
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -55,15 +58,37 @@ def main():
     with open(os.path.join(output_dir, 'config.yaml'), 'w') as f:
         yaml.dump(config, f)
 
+    # Init wandb
+    run = None
+    if not args.no_wandb:
+        run = wandb.init(
+            entity="mbzuai-research",
+            project="social-hrl",
+            name=f"{args.mode}_seed{args.seed}",
+            config={
+                'mode': args.mode,
+                'seed': args.seed,
+                'env': config['env']['name'],
+                'total_timesteps': config['ppo']['total_timesteps'],
+                **{f"ppo/{k}": v for k, v in config['ppo'].items()},
+                **{f"encoder/{k}": v for k, v in config['encoder'].items()},
+                **{f"manager/{k}": v for k, v in config['manager'].items()},
+                **{f"worker/{k}": v for k, v in config['worker'].items()},
+                **{f"comm/{k}": v for k, v in config['communication'].items()},
+            },
+            tags=[args.mode, config['env']['name']],
+        )
+
     print(f"=" * 60)
     print(f"Social HRL - Mode: {args.mode} - Seed: {args.seed}")
     print(f"Environment: {config['env']['name']}")
     print(f"Output: {output_dir}")
+    print(f"Wandb: {'enabled' if run else 'disabled'}")
     print(f"=" * 60)
 
     # Train
     trainer = HRLTrainer(config, mode=args.mode, device=args.device)
-    results = trainer.train(output_dir=output_dir)
+    results = trainer.train(output_dir=output_dir, wandb_run=run)
 
     # Compute and save metrics
     metrics = {}
@@ -88,6 +113,11 @@ def main():
 
     # Save returns for plotting
     np.save(os.path.join(output_dir, 'returns.npy'), np.array(results['returns']))
+
+    # Log final metrics to wandb
+    if run is not None:
+        run.summary.update(metrics)
+        run.finish()
 
     print(f"\nFinal metrics:")
     for k, v in metrics.items():
