@@ -11,6 +11,7 @@ import os
 import sys
 import yaml
 import json
+from datetime import datetime
 import numpy as np
 import wandb
 
@@ -51,7 +52,11 @@ def main():
     if args.env:
         config['env']['name'] = args.env
 
-    output_dir = args.output_dir or f"outputs/{args.mode}_seed{args.seed}"
+    now = datetime.now()
+    exp_name = f"{args.mode}_seed{args.seed}"
+    output_dir = args.output_dir or os.path.join(
+        "outputs", now.strftime("%Y-%m-%d"), exp_name, now.strftime("%H-%M-%S")
+    )
     os.makedirs(output_dir, exist_ok=True)
 
     # Save config
