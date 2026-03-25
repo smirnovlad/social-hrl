@@ -156,6 +156,10 @@ class HRLTrainer:
         self.global_step = 0
         self.log = defaultdict(list)
 
+        # Persistent obs across rollouts (don't reset every rollout)
+        obs, _ = self.envs.reset()
+        self.obs = torch.from_numpy(obs).to(self.device)
+
     def _anneal_tau(self):
         """Anneal Gumbel-Softmax temperature."""
         if self.mode != 'discrete':
@@ -179,8 +183,7 @@ class HRLTrainer:
         done_buf = torch.zeros(self.num_steps, self.num_envs).to(self.device)
         val_buf = torch.zeros(self.num_steps, self.num_envs).to(self.device)
 
-        obs, _ = self.envs.reset()
-        obs = torch.from_numpy(obs).to(self.device)
+        obs = self.obs
         episode_rewards = np.zeros(self.num_envs)
         episode_returns = []
 
@@ -208,6 +211,9 @@ class HRLTrainer:
 
             obs = torch.from_numpy(next_obs).to(self.device)
             self.global_step += self.num_envs
+
+        # Store obs for next rollout
+        self.obs = obs
 
         # Bootstrap value
         with torch.no_grad():
@@ -252,8 +258,7 @@ class HRLTrainer:
         # Message tracking for analysis
         messages_log = [] if self.mode == 'discrete' else None
 
-        obs, _ = self.envs.reset()
-        obs = torch.from_numpy(obs).to(self.device)
+        obs = self.obs
 
         current_goal = torch.zeros(N, self.config['manager']['goal_dim']).to(self.device)
         manager_extrinsic_reward = torch.zeros(N).to(self.device)
@@ -353,6 +358,9 @@ class HRLTrainer:
             steps_since_goal += 1
             obs = next_obs_t
             self.global_step += self.num_envs
+
+        # Store obs for next rollout
+        self.obs = obs
 
         # Bootstrap worker value
         with torch.no_grad():
