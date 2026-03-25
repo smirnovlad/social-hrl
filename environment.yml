@@ -1,0 +1,16 @@
+name: social-hrl
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch>=2.0
+  - cpuonly  # replace with `pytorch-cuda=12.1` if you want GPU support
+  - numpy>=1.24
+  - matplotlib>=3.7
+  - pyyaml>=6.0
+  - pip
+  - pip:
+    - minigrid>=2.3.0
+    - gymnasium>=0.29.0

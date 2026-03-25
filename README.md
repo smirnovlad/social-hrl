@@ -7,8 +7,16 @@ ML8103 Sequential Decision Making — MBZUAI Spring 2026
 ## Setup
 
 ```bash
+# Option A: Conda (recommended)
+conda env create -f environment.yml
+conda activate social-hrl
+
+# Option B: pip with venv
+python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 ```
+
+For GPU support, edit `environment.yml`: replace `cpuonly` with `pytorch-cuda=12.1` (or your CUDA version).
 
 ## Quick Start
 
