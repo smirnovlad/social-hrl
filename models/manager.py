@@ -62,7 +62,7 @@ class Manager(nn.Module):
 
         h = self.policy(x)
         mean = self.goal_mean(h)
-        std = self.goal_logstd.exp().expand_as(mean)
+        std = self.goal_logstd.clamp(-5, 2).exp().expand_as(mean)
 
         dist = Normal(mean, std)
         goal = dist.rsample()
@@ -81,7 +81,7 @@ class Manager(nn.Module):
 
         h = self.policy(x)
         mean = self.goal_mean(h)
-        std = self.goal_logstd.exp().expand_as(mean)
+        std = self.goal_logstd.clamp(-5, 2).exp().expand_as(mean)
 
         dist = Normal(mean, std)
         log_prob = dist.log_prob(goals).sum(dim=-1)

@@ -136,7 +136,7 @@ class HRLTrainer:
                 worker_params, lr=ppo_cfg['lr'], eps=1e-5
             )
             self.manager_optimizer = torch.optim.Adam(
-                manager_params, lr=ppo_cfg['lr'], eps=1e-5
+                manager_params, lr=ppo_cfg['lr'] * 0.1, eps=1e-5
             )
 
         # PPO config
@@ -500,7 +500,8 @@ class HRLTrainer:
             M = m_data['advantages'].shape[0]
             if M > 4:
                 m_batch_size = max(1, M // 2)
-                for _ in range(self.update_epochs):
+                # Fewer epochs + tighter clip for manager (sparse data, prevent NaN)
+                for _ in range(1):
                     indices = torch.randperm(M)
                     for start in range(0, M, m_batch_size):
                         end = min(start + m_batch_size, M)
@@ -521,7 +522,7 @@ class HRLTrainer:
 
                         stats = ppo_update(
                             batch, manager_policy_fn, self.manager_optimizer,
-                            self.clip_eps, self.entropy_coef * 0.1, self.value_coef, self.max_grad_norm
+                            0.1, self.entropy_coef * 0.1, self.value_coef, self.max_grad_norm
                         )
                         for k, v in stats.items():
                             all_stats[f'manager_{k}'].append(v)
@@ -558,7 +559,7 @@ class HRLTrainer:
                     for pg in self.worker_optimizer.param_groups:
                         pg['lr'] = lr
                     for pg in self.manager_optimizer.param_groups:
-                        pg['lr'] = lr
+                        pg['lr'] = lr * 0.1
 
             # Collect rollout
             if self.mode == 'flat':
