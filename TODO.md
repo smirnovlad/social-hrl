@@ -38,13 +38,9 @@ Needs: install dependencies, debug runtime, run experiments.
 
 ## Phase 5: Transfer Experiment
 
-- [ ] Implement `scripts/evaluate_transfer.py`:
-  - Load trained manager checkpoint from each condition
-  - Freeze manager weights
-  - Train a fresh worker on a NEW Minigrid layout (different from training)
-  - Measure worker learning speed (sample efficiency)
-- [ ] Run transfer for each condition's manager
-- [ ] Plot comparison: sample efficiency of worker under frozen managers from (a) vs (b) vs (c)
+- [x] Implement `scripts/evaluate_transfer.py`
+- [x] Run transfer for discrete and social managers -> KeyCorridorS4R3 (500K steps × 3 seeds)
+- [x] Result: null — neither condition achieves nonzero returns on harder env at 500K steps
 
 ## Phase 6: Analysis & Write-up
 
