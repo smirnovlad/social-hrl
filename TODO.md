@@ -24,26 +24,17 @@ Needs: install dependencies, debug runtime, run experiments.
 
 ## Phase 3: Experiment 1 — Three-Way Comparison (1M steps × 3 seeds)
 
-- [ ] Run all conditions: `bash scripts/run_all.sh` (runs flat/continuous/discrete × 3 seeds in parallel)
-- [ ] Or run individually on 2 GPUs:
-  ```
-  CUDA_VISIBLE_DEVICES=0 python scripts/train.py --mode flat --seed 42 --total-timesteps 1000000 &
-  CUDA_VISIBLE_DEVICES=1 python scripts/train.py --mode continuous --seed 42 --total-timesteps 1000000 &
-  ```
-- [ ] Generate plots: `python scripts/plot_results.py --experiment-dir outputs/`
-- [ ] Compare: goal entropy, goal coverage, temporal extent, and learning curves across conditions
-- [ ] Expected result: discrete > continuous > flat on goal quality metrics
+- [x] Run all conditions: 3 modes × 3 seeds × 1M steps (flat/continuous/discrete)
+- [x] Generate plots: `python scripts/plot_results.py --experiment-dir outputs/`
+- [x] Compare: goal entropy, goal coverage, temporal extent, and learning curves across conditions
+- [x] Expected result: discrete > continuous on goal quality (confirmed); continuous collapses (documented as negative result)
 
-## Phase 4: Multi-Agent (condition c) — NOT YET IMPLEMENTED
+## Phase 4: Multi-Agent (condition c)
 
-- [ ] Implement `algos/multi_agent_trainer.py` — MAPPO training loop for two communicating agents
-  - Use `envs/multi_agent_env.py` (TwoAgentCorridorEnv) — already written
-  - Use `models/communication.py` (CommunicationChannel.embed_message) — already written
-  - Each agent's manager receives partner's message as additional input
-  - Shared critic (centralized value function sees both observations)
-- [ ] Add `--mode social` to `scripts/train.py`
-- [ ] Run condition (c): `python scripts/train.py --mode social --seed 42 --total-timesteps 1000000`
-- [ ] Compare against conditions (a), (b) from Phase 3
+- [x] Implement `algos/multi_agent_trainer.py` — MAPPO training loop for two communicating agents
+- [x] Add `--mode social` to `scripts/train.py`
+- [x] Run condition (c): 3 seeds × 1M steps
+- [x] Compare against conditions (a), (b) from Phase 3
 
 ## Phase 5: Transfer Experiment
 
