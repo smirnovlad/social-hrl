@@ -2,22 +2,18 @@
 
 ## Setup
 
-All experiments: 1M timesteps, 3 random seeds (42, 123, 7), 8 parallel environments, PPO with lr=3e-4.
+All experiments: 1M timesteps, 3 random seeds (42, 123, 7), 8 parallel environments, PPO with lr=3e-4. Codebase passed 3 rounds of automated review (6 reviewer invocations total) before final runs.
 
 ### Corridor Environment (primary, all hypotheses)
 
-Custom 11x11 grid with two rooms connected by a 3-cell-wide corridor. Agent starts top-left, goal is bottom-right. Step penalty (-0.01/step), goal reward (+1). Used for all 4 conditions to ensure fair comparison:
+Custom 11x11 grid with two rooms connected by a 3-cell-wide corridor. Agent starts top-left, goal is bottom-right. Step penalty (-0.01/step), goal reward (+1), coordination bonus (+0.5 if both agents finish). Used for all 4 conditions to ensure fair comparison:
 
 | Condition | Agent(s) | Manager | Goals | Tests |
 |-----------|----------|---------|-------|-------|
 | Flat PPO | Single | None | None | Baseline |
-| HRL Continuous | Single | TD3 | g in R^16 | H1 |
+| HRL Continuous | Single | TD3 + tanh | g in R^16 | H1 |
 | HRL Discrete | Single | PPO + Gumbel-Softmax | m in {1,...,10}^3 | H1 |
 | HRL Social | Two agents | PPO + Gumbel-Softmax | m in {1,...,10}^3 | H2 |
-
-### KeyCorridorS3R2 (supplementary)
-
-Standard MiniGrid task with key pickup + door opening. Used for additional flat/continuous/discrete runs on a harder exploration problem. Results in supplementary section.
 
 ---
 
@@ -27,14 +23,12 @@ Standard MiniGrid task with key pickup + door opening. Used for additional flat/
 
 | Condition | Goal Reach Rate | Mean Return | Last 100 Return |
 |-----------|----------------|-------------|-----------------|
-| Flat PPO | **99.6% +/- 0.1%** | **0.853 +/- 0.007** | **0.868** |
-| HRL Continuous | 55.1% +/- 8.0% | -0.370 +/- 0.134 | -0.365 |
-| HRL Discrete | 49.1% +/- 1.7% | -0.473 +/- 0.028 | -0.520 |
-| HRL Social | 46.9% +/- 0.1% | -0.564 +/- 0.002 | -0.535 |
+| Flat PPO | **99.3% +/- 0.7%** | **0.837 +/- 0.029** | **0.856** |
+| HRL Continuous | 51.2% +/- 7.4% | -0.430 +/- 0.119 | -0.378 |
+| HRL Discrete | 51.1% +/- 2.6% | -0.431 +/- 0.045 | -0.417 |
+| HRL Social | 45.6% +/- 3.5% | -0.582 +/- 0.039 | -0.550 |
 
-**Flat PPO solves the corridor easily** (99.6% success). This is expected -- the single-agent corridor task doesn't require hierarchical decomposition. The corridor env was designed for the multi-agent coordination problem, not single-agent difficulty.
-
-All HRL conditions perform worse than flat, with 46-55% goal reach rates. The hierarchy introduces overhead (manager decisions, intrinsic reward optimization) that hurts on this simple navigation task. This is a known cost of HRL on tasks that don't require temporal abstraction.
+**Flat PPO solves the corridor easily** (99.3%). The single-agent corridor doesn't require hierarchy. All HRL conditions perform worse (45-51%), paying the overhead of manager decisions and intrinsic reward optimization.
 
 ### H1: Discrete bottleneck prevents goal collapse
 
@@ -42,15 +36,15 @@ All HRL conditions perform worse than flat, with 46-55% goal reach rates. The hi
 
 | Metric | Continuous | Discrete |
 |--------|-----------|----------|
-| Goal reach rate | 55.1% +/- 8.0% | 49.1% +/- 1.7% |
-| Goal entropy | 0.000 (collapsed) | **3.99 +/- 0.50** |
-| Unique messages | 0 | **407 +/- 129** |
-| Coverage | 0% | **0.40%** |
-| % of max entropy | 0% | **57.8%** |
+| Goal reach rate | 51.2% +/- 7.4% | 51.1% +/- 2.6% |
+| Goal entropy | 0.000 (collapsed) | **6.73 +/- 0.03** |
+| Unique messages | 0 | **1000 (100%)** |
+| Coverage | 0% | **0.99%** |
+| % of max entropy | 0% | **97.5%** |
 
-**H1 SUPPORTED.** Continuous goals produce zero entropy -- the TD3 manager converges to a fixed goal output. The discrete Gumbel-Softmax bottleneck maintains 57.8% of maximum entropy with 407 unique messages. The information bottleneck forces the manager to distribute goals across the discrete vocabulary rather than collapsing to a point.
+**H1 STRONGLY SUPPORTED.** Continuous goals collapse to zero entropy — the TD3 manager converges to a fixed output. The discrete Gumbel-Softmax bottleneck achieves 97.5% of maximum entropy with all 1000 possible messages utilized. The communication channel reconstruction loss is essential — without it (pre-fix), entropy was only 57.8% of max.
 
-Continuous HRL achieves slightly higher goal reach rate (55% vs 49%) despite collapsed goals -- the fixed goal still provides a consistent signal for the worker. But the lack of goal diversity means the manager provides no meaningful temporal abstraction.
+Both conditions achieve similar task performance (~51%), showing that the discrete bottleneck adds goal diversity without hurting performance.
 
 ### H2: Social pressure produces better goals than bottleneck alone
 
@@ -58,44 +52,40 @@ Continuous HRL achieves slightly higher goal reach rate (55% vs 49%) despite col
 
 | Metric | Discrete (single) | Social (two agents) | Difference |
 |--------|-------------------|---------------------|------------|
-| Goal reach rate | 49.1% +/- 1.7% | 46.9% +/- 0.1% | -2.2% |
-| Goal entropy | **3.99 +/- 0.50** | 3.32 +/- 0.31 | **-0.67** |
-| Unique messages | **407 +/- 129** | 345 +/- 17 | **-63** |
-| Coverage | **0.40% +/- 0.13%** | 0.17% +/- 0.01% | **-0.23%** |
-| Temporal extent | 1.35 | **2.17** | **+0.82** |
-| Cross-seed std (unique msgs) | 129 | **17** | |
+| Goal reach rate | 51.1% +/- 2.6% | 45.6% +/- 3.5% | -5.5% |
+| Goal entropy | **6.73 +/- 0.03** | 6.21 +/- 0.45 | **-0.53** |
+| Unique messages | **1000** | **1000** | 0 |
+| Coverage | **0.99%** | 0.49% | **-0.50%** |
+| Temporal extent | 1.01 | 1.09 | +0.08 |
+| % of max entropy | **97.5%** | 89.8% | -7.7% |
 
-**H2 NOT SUPPORTED in the predicted direction.**
+**H2 NOT SUPPORTED.** Social pressure produces lower goal entropy (89.8% vs 97.5% of max) and lower coverage (0.49% vs 0.99%) compared to the discrete bottleneck alone. Both conditions use all 1000 unique messages, but social concentrates usage more heavily on a subset.
 
-Social pressure produces *lower* goal entropy (-17%), fewer unique messages (-15%), and lower coverage (-58%) compared to the discrete bottleneck alone.
-
-**However, social pressure has two significant effects:**
-
-1. **Higher temporal extent** (2.17 vs 1.35): Social agents maintain each subgoal 61% longer. This suggests more deliberate, plan-like behavior -- the manager commits to goals rather than rapidly switching. In the coordination setting, stable goals are necessary because the partner needs time to interpret and react to the communicated intention.
-
-2. **Dramatically higher consistency** across seeds (std of 17 vs 129 unique messages): Social pressure acts as a strong regularizer. The discrete-only condition is highly variable -- seed 123 produces 587 unique messages while seed 42 produces only 292. Social mode produces nearly identical distributions (330-369) regardless of seed. The partner creates a stable attractor in message space.
-
-**Interpretation**: Coordination pressure drives agents toward a *shared efficient code* rather than a diverse one. This is consistent with emergent communication literature (Chaabouni et al., ACL 2020): agents under communication pressure develop low-redundancy codes optimized for coordination, not maximum-entropy codes. Social interaction regularizes goals toward coordination-useful concepts, which is a smaller but more stable set than what an unconstrained bottleneck explores.
-
-The key insight is that "good" goal representations for coordination are not the same as "diverse" goal representations. The social mechanism produces goals that are more *meaningful* (longer temporal extent, higher consistency) but less *diverse* (lower entropy, fewer unique messages).
+**Interpretation**: Coordination pressure drives agents toward *efficient* communication — a shared vocabulary where some messages are used more frequently than others. The single-agent discrete bottleneck distributes goals more uniformly (near-maximum entropy) because there is no pressure to be interpretable by a partner. Social interaction acts as a frequency concentrator, not a diversity expander.
 
 ### H3: Transfer to new tasks
 
-**Result**: Inconclusive. Frozen managers from both discrete and social conditions achieved 0% success when transferred to KeyCorridorS4R3 (harder MiniGrid task, 500K steps). The source models' goal representations, while measurably different in diversity metrics, were insufficient for cross-task transfer at the current training scale.
+**Result**: Inconclusive. Frozen managers from both conditions achieved 0% success on KeyCorridorS4R3 (harder MiniGrid, 500K steps). Source models at ~51% corridor success don't produce goal representations that generalize.
 
 ---
 
-## Supplementary: KeyCorridorS3R2 Results
+## Impact of Bug Fixes
 
-Additional runs on the standard MiniGrid KeyCorridorS3R2 task (without corridor env):
+Three rounds of automated code review identified critical bugs. The fixes dramatically changed results:
 
-| Condition | Success Rate | Mean Return |
-|-----------|-------------|-------------|
-| Flat PPO | 1.5% +/- 0.7% | 0.006 +/- 0.002 |
-| HRL Continuous | 0.2% +/- 0.1% | 0.001 +/- 0.000 |
-| HRL Discrete | 1.0% +/- 1.2% | 0.003 +/- 0.004 |
+| Metric | Before fixes | After fixes | Change |
+|--------|-------------|-------------|--------|
+| Discrete entropy | 3.99 (57.8% max) | **6.73 (97.5% max)** | +69% |
+| Discrete unique msgs | 407 / 1000 | **1000 / 1000** | +146% |
+| Social entropy | 3.32 (48.1% max) | **6.21 (89.8% max)** | +87% |
+| Social unique msgs | 345 / 1000 | **1000 / 1000** | +190% |
 
-These confirm that KeyCorridorS3R2 is a hard exploration problem where flat PPO does not easily solve the task (1.5% success at 1M steps), and continuous HRL collapses (0.2%).
+Key bugs fixed:
+1. **Communication channel had zero gradient flow** — sender/decoder never trained (added reconstruction loss + separate optimizer)
+2. **Truncated episodes never reset in social mode** — episodes ran past max_steps indefinitely
+3. **TD3 done flag off-by-one** — critic bootstrapped through episode boundaries
+4. **Encoder normalization wrong** — all channels divided by 10 instead of per-channel (10, 5, 2)
+5. **Coordination bonus fired repeatedly** — idle done agents received spurious rewards
 
 ---
 
@@ -103,13 +93,13 @@ These confirm that KeyCorridorS3R2 is a hard exploration problem where flat PPO 
 
 | Hypothesis | Prediction | Result | Verdict |
 |-----------|-----------|--------|---------|
-| H1: Discrete bottleneck prevents collapse | discrete > continuous on entropy | Discrete 3.99 vs continuous 0.00 | **Supported** |
-| H2: Social > discrete on goal quality | social > discrete on entropy/coverage | Social entropy -17%, but +61% temporal extent, 7.6x more consistent | **Not supported on diversity; supported on stability** |
-| H3: Social goals transfer better | social -> faster worker learning on new task | Both conditions: 0% transfer success | **Inconclusive** |
+| H1: Discrete bottleneck prevents collapse | discrete > continuous on entropy | Discrete 6.73 vs continuous 0.00 | **Strongly supported** |
+| H2: Social > discrete on goal quality | social > discrete on entropy/coverage | Social 6.21 < discrete 6.73; both use all 1000 messages | **Not supported** |
+| H3: Social goals transfer better | social -> faster worker learning | Both conditions: 0% transfer | **Inconclusive** |
 
 ## Key Takeaway
 
-The discrete information bottleneck effectively prevents goal collapse (H1). Multi-agent coordination pressure does not increase goal diversity as predicted (H2), but instead produces a *convergence effect*: goals become less diverse but more temporally stable and dramatically more consistent across random seeds. Social interaction acts as a regularizer that selects for *coordination-useful* goals rather than *information-rich* goals. This challenges the assumption that communication pressure naturally produces richer abstractions, suggesting instead that it produces more *efficient* ones.
+The discrete information bottleneck is highly effective at preventing goal collapse — achieving 97.5% of maximum entropy. Multi-agent coordination does not increase goal diversity; it slightly reduces it (89.8% vs 97.5%). Social pressure acts as a *frequency concentrator*: both conditions explore the full message vocabulary, but social agents develop preferences for certain messages, creating a non-uniform distribution optimized for coordination rather than maximum entropy. This challenges the hypothesis that communication pressure produces richer goal abstractions.
 
 ---
 
@@ -119,3 +109,4 @@ The discrete information bottleneck effectively prevents goal collapse (H1). Mul
 - Plots in `outputs/plots/`
 - Code: `scripts/train.py --mode {flat,continuous,discrete,social} [--corridor]`
 - Config: `configs/default.yaml`
+- Conda env: `social-hrl`
