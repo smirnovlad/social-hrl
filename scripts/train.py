@@ -42,6 +42,8 @@ def main():
     parser.add_argument('--config', type=str, default='configs/default.yaml')
     parser.add_argument('--output-dir', type=str, default=None)
     parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--corridor', action='store_true',
+                        help='Use corridor env instead of MiniGrid (for fair social comparison)')
     parser.add_argument('--no-wandb', action='store_true',
                         help='Disable wandb logging')
     args = parser.parse_args()
@@ -55,7 +57,8 @@ def main():
         config['env']['name'] = args.env
 
     now = datetime.now()
-    exp_name = f"{args.mode}_seed{args.seed}"
+    suffix = "_corridor" if args.corridor else ""
+    exp_name = f"{args.mode}{suffix}_seed{args.seed}"
     output_dir = args.output_dir or os.path.join(
         "outputs", now.strftime("%Y-%m-%d"), exp_name, now.strftime("%H-%M-%S")
     )
@@ -71,7 +74,7 @@ def main():
         run = wandb.init(
             entity="mbzuai-research",
             project="social-hrl",
-            name=f"{args.mode}_seed{args.seed}",
+            name=exp_name,
             config={
                 'mode': args.mode,
                 'seed': args.seed,
@@ -97,7 +100,8 @@ def main():
     if args.mode == 'social':
         trainer = MultiAgentTrainer(config, device=args.device)
     else:
-        trainer = HRLTrainer(config, mode=args.mode, device=args.device)
+        trainer = HRLTrainer(config, mode=args.mode, device=args.device,
+                             use_corridor=args.corridor)
     results = trainer.train(output_dir=output_dir, wandb_run=run)
 
     # Compute and save metrics

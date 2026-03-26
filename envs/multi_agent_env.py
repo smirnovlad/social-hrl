@@ -197,6 +197,53 @@ class TwoAgentCorridorEnv(MiniGridEnv):
         return tuple(obs_list), tuple(reward_list), all_done, truncated, info
 
 
+class SingleAgentCorridorEnv(gym.Wrapper):
+    """Single-agent version of the corridor env for fair comparison.
+
+    Same layout as TwoAgentCorridorEnv but with only agent A.
+    Agent must navigate from top-left to goal in bottom-right through corridor.
+    Returns gym-compatible (obs, reward, terminated, truncated, info).
+    """
+
+    def __init__(self, size=11, corridor_length=3, max_steps=200):
+        env = TwoAgentCorridorEnv(
+            size=size, corridor_length=corridor_length, max_steps=max_steps,
+        )
+        super().__init__(env)
+        self.observation_space = env.observation_space['image']
+
+    def reset(self, **kwargs):
+        (obs_a, _obs_b), info = self.env.reset(**kwargs)
+        return obs_a, info
+
+    def step(self, action):
+        # Step agent A only, agent B is frozen (action=0 = turn left = effectively idle)
+        (obs_a, _), (rew_a, _), all_done, truncated, info = self.env.step((action, 0))
+        terminated = self.env.agent_dones[0]
+        return obs_a, rew_a, terminated, truncated or (all_done and not terminated), info
+
+
+def make_corridor_vec_env(num_envs, seed=0, max_steps=200, single_agent=True):
+    """Create vectorized corridor environments.
+
+    Args:
+        num_envs: Number of parallel envs.
+        seed: Base seed.
+        max_steps: Max steps per episode.
+        single_agent: If True, single-agent version for discrete mode comparison.
+    """
+    def _make(i):
+        def _init():
+            env = SingleAgentCorridorEnv(
+                size=11, corridor_length=3, max_steps=max_steps,
+            )
+            env.reset(seed=seed + i)
+            return env
+        return _init
+
+    return gym.vector.SyncVectorEnv([_make(i) for i in range(num_envs)])
+
+
 class MultiAgentWrapper:
     """Wrapper that presents TwoAgentCorridorEnv with a gym-like interface.
 

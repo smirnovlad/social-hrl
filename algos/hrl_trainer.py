@@ -57,7 +57,7 @@ class FlatPolicy(nn.Module):
 class HRLTrainer:
     """Training loop for single-agent HRL experiments."""
 
-    def __init__(self, config, mode='continuous', device='cuda'):
+    def __init__(self, config, mode='continuous', device='cuda', use_corridor=False):
         self.config = config
         self.mode = mode
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
@@ -65,11 +65,19 @@ class HRLTrainer:
         # Create environments
         env_cfg = config['env']
         ppo_cfg = config['ppo']
-        self.envs = make_vec_env(
-            env_cfg['name'], ppo_cfg['num_envs'],
-            seed=config['experiment']['seed'],
-            max_steps=env_cfg.get('max_steps'),
-        )
+        if use_corridor:
+            from envs.multi_agent_env import make_corridor_vec_env
+            self.envs = make_corridor_vec_env(
+                ppo_cfg['num_envs'],
+                seed=config['experiment']['seed'],
+                max_steps=env_cfg.get('max_steps', 200),
+            )
+        else:
+            self.envs = make_vec_env(
+                env_cfg['name'], ppo_cfg['num_envs'],
+                seed=config['experiment']['seed'],
+                max_steps=env_cfg.get('max_steps'),
+            )
 
         obs_shape = self.envs.single_observation_space.shape
         num_actions = self.envs.single_action_space.n
