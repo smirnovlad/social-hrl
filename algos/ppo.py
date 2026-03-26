@@ -70,12 +70,14 @@ def ppo_update(batch, policy_fn, optimizer, clip_eps=0.2, entropy_coef=0.01,
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
     # Policy loss (clipped surrogate)
-    ratio = (new_log_probs - batch['old_log_probs']).exp()
+    log_ratio = new_log_probs - batch['old_log_probs']
+    log_ratio = torch.clamp(log_ratio, -20, 20)  # prevent inf in exp()
+    ratio = log_ratio.exp()
     surr1 = ratio * advantages
     surr2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * advantages
     policy_loss = -torch.min(surr1, surr2).mean()
 
-    # Value loss
+    # Value loss (clamp predictions to prevent explosion)
     value_loss = 0.5 * (values - batch['returns']).pow(2).mean()
 
     # Entropy bonus
@@ -83,6 +85,13 @@ def ppo_update(batch, policy_fn, optimizer, clip_eps=0.2, entropy_coef=0.01,
 
     # Total loss
     loss = policy_loss + value_coef * value_loss + entropy_coef * entropy_loss
+
+    # Skip update if loss is NaN
+    if torch.isnan(loss) or torch.isinf(loss):
+        return {
+            'loss': 0.0, 'policy_loss': 0.0, 'value_loss': 0.0,
+            'entropy': 0.0, 'approx_kl': 0.0,
+        }
 
     optimizer.zero_grad()
     loss.backward()
@@ -92,10 +101,11 @@ def ppo_update(batch, policy_fn, optimizer, clip_eps=0.2, entropy_coef=0.01,
     )
     optimizer.step()
 
+    approx_kl = ((ratio - 1) - log_ratio).mean().item()
     return {
         'loss': loss.item(),
         'policy_loss': policy_loss.item(),
         'value_loss': value_loss.item(),
         'entropy': -entropy_loss.item(),
-        'approx_kl': (batch['old_log_probs'] - new_log_probs).mean().item(),
+        'approx_kl': approx_kl,
     }
