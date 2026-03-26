@@ -40,7 +40,7 @@ def find_latest_runs(base_dir):
         # Parse: outputs/DATE/mode_seedN/TIME/returns.npy
         parts = run_dir.parts
         for i, part in enumerate(parts):
-            match = re.match(r'^(flat|continuous|discrete|discrete_corridor|social)_seed(\d+)$', part)
+            match = re.match(r'^(flat_corridor|continuous_corridor|flat|continuous|discrete_corridor|discrete|social)_seed(\d+)$', part)
             if match:
                 mode = match.group(1)
                 seed = int(match.group(2))
@@ -71,8 +71,10 @@ def plot_learning_curves(runs, output_path):
     fig, ax = plt.subplots(1, 1, figsize=(10, 6))
 
     conditions = {
-        'flat': ('Flat PPO', '#1f77b4'),
-        'continuous': ('HRL Continuous', '#ff7f0e'),
+        'flat': ('Flat PPO (KeyCorridor)', '#1f77b4'),
+        'flat_corridor': ('Flat PPO (corridor)', '#aec7e8'),
+        'continuous': ('HRL Continuous (KeyCorridor)', '#ff7f0e'),
+        'continuous_corridor': ('HRL Continuous (corridor)', '#ffbb78'),
         'discrete': ('HRL Discrete', '#2ca02c'),
         'discrete_corridor': ('HRL Discrete (corridor)', '#9467bd'),
         'social': ('HRL Social', '#d62728'),
@@ -120,8 +122,10 @@ def plot_success_rate(runs, output_path):
     fig, ax = plt.subplots(1, 1, figsize=(10, 6))
 
     conditions = {
-        'flat': ('Flat PPO', '#1f77b4'),
-        'continuous': ('HRL Continuous', '#ff7f0e'),
+        'flat': ('Flat PPO (KeyCorridor)', '#1f77b4'),
+        'flat_corridor': ('Flat PPO (corridor)', '#aec7e8'),
+        'continuous': ('HRL Continuous (KeyCorridor)', '#ff7f0e'),
+        'continuous_corridor': ('HRL Continuous (corridor)', '#ffbb78'),
         'discrete': ('HRL Discrete', '#2ca02c'),
         'discrete_corridor': ('HRL Discrete (corridor)', '#9467bd'),
         'social': ('HRL Social', '#d62728'),
@@ -261,7 +265,7 @@ def generate_summary_table(runs, output_path):
     """Generate a markdown summary table."""
     conditions = ['flat', 'continuous', 'discrete', 'discrete_corridor', 'social']
     labels = {
-        'flat': 'Flat PPO', 'continuous': 'HRL Continuous',
+        'flat': 'Flat PPO (KeyCorridor)', 'flat_corridor': 'Flat PPO (corridor)', 'continuous': 'HRL Continuous (KeyCorridor)', 'continuous_corridor': 'HRL Continuous (corridor)',
         'discrete': 'HRL Discrete', 'discrete_corridor': 'HRL Discrete (corridor)',
         'social': 'HRL Social',
     }
