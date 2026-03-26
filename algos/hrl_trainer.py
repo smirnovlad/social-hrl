@@ -434,9 +434,9 @@ class HRLTrainer:
                     self.manager_td3.add_transition(
                         state=m_feat_buf[i][j].unsqueeze(0),
                         goal=m_goal_buf[i][j].unsqueeze(0),
-                        reward=torch.tensor([m_rew_buf[i][j + 1]]),  # reward after this goal
+                        reward=torch.tensor([m_rew_buf[i][j + 1]]),  # reward during goal j
                         next_state=m_feat_buf[i][j + 1].unsqueeze(0),
-                        done=torch.tensor([m_done_buf[i][j + 1]]),
+                        done=torch.tensor([m_done_buf[i][j]]),  # episode ended during goal j?
                     )
 
         elif self.mode == 'discrete':
