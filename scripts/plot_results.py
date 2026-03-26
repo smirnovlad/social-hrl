@@ -40,7 +40,7 @@ def find_latest_runs(base_dir):
         # Parse: outputs/DATE/mode_seedN/TIME/returns.npy
         parts = run_dir.parts
         for i, part in enumerate(parts):
-            match = re.match(r'^(flat|continuous|discrete|social)_seed(\d+)$', part)
+            match = re.match(r'^(flat|continuous|discrete|discrete_corridor|social)_seed(\d+)$', part)
             if match:
                 mode = match.group(1)
                 seed = int(match.group(2))
@@ -74,6 +74,7 @@ def plot_learning_curves(runs, output_path):
         'flat': ('Flat PPO', '#1f77b4'),
         'continuous': ('HRL Continuous', '#ff7f0e'),
         'discrete': ('HRL Discrete', '#2ca02c'),
+        'discrete_corridor': ('HRL Discrete (corridor)', '#9467bd'),
         'social': ('HRL Social', '#d62728'),
     }
 
@@ -122,6 +123,7 @@ def plot_success_rate(runs, output_path):
         'flat': ('Flat PPO', '#1f77b4'),
         'continuous': ('HRL Continuous', '#ff7f0e'),
         'discrete': ('HRL Discrete', '#2ca02c'),
+        'discrete_corridor': ('HRL Discrete (corridor)', '#9467bd'),
         'social': ('HRL Social', '#d62728'),
     }
 
@@ -170,8 +172,8 @@ def plot_success_rate(runs, output_path):
 def plot_goal_metrics(runs, output_path):
     """Plot goal quality metrics comparison as bar charts."""
     conditions = {
-        'continuous': ('HRL Continuous', '#ff7f0e'),
         'discrete': ('HRL Discrete', '#2ca02c'),
+        'discrete_corridor': ('HRL Discrete (corridor)', '#9467bd'),
         'social': ('HRL Social', '#d62728'),
     }
 
@@ -257,10 +259,11 @@ def plot_discrete_token_usage(runs, output_path):
 
 def generate_summary_table(runs, output_path):
     """Generate a markdown summary table."""
-    conditions = ['flat', 'continuous', 'discrete', 'social']
+    conditions = ['flat', 'continuous', 'discrete', 'discrete_corridor', 'social']
     labels = {
         'flat': 'Flat PPO', 'continuous': 'HRL Continuous',
-        'discrete': 'HRL Discrete', 'social': 'HRL Social',
+        'discrete': 'HRL Discrete', 'discrete_corridor': 'HRL Discrete (corridor)',
+        'social': 'HRL Social',
     }
 
     rows = []

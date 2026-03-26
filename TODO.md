@@ -44,8 +44,8 @@ Needs: install dependencies, debug runtime, run experiments.
 
 ## Phase 6: Analysis & Write-up
 
-- [ ] Generate all final plots (learning curves, goal metrics bar charts, transfer curves)
-- [ ] Write results summary
+- [x] Generate all final plots (learning curves, goal metrics bar charts, transfer curves)
+- [x] Write results summary (RESULTS.md)
 - [ ] Prepare 15-minute presentation
 
 ---
