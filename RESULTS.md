@@ -65,7 +65,9 @@ Both conditions achieve similar task performance (~51%), showing that the discre
 
 ### H3: Transfer to new tasks
 
-**Result**: Inconclusive. Frozen managers from both conditions achieved 0% success on KeyCorridorS4R3 (harder MiniGrid, 500K steps). Source models at ~51% corridor success don't produce goal representations that generalize.
+**Test**: Freeze trained managers from discrete and social conditions (51% corridor success), train fresh workers on KeyCorridorS4R3 (500K steps, 3 seeds each).
+
+**Result**: Inconclusive (0% success for both conditions, both pre- and post-bugfix runs). The frozen encoder produces meaningless features on the new environment — it was trained on the corridor layout and has never seen keys, doors, or the KeyCorridor geometry. Without useful encoder features, the frozen manager cannot produce useful goals regardless of goal diversity. A meaningful transfer test would require either same-family environments (e.g., corridors with different room layouts) or fine-tuning the encoder alongside the worker.
 
 ---
 
