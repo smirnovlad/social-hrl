@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import torch.nn.functional as nnf
 import copy
 
 
@@ -100,7 +101,7 @@ class TD3Actor(nn.Module):
         )
 
     def forward(self, state):
-        return self.net(state)
+        return torch.tanh(self.net(state))
 
 
 class ManagerTD3:

@@ -451,6 +451,28 @@ class MultiAgentTrainer:
                     for k, v in stats.items():
                         all_stats[f'manager_{k}'].append(v)
 
+        # Communication channel reconstruction loss (both agents)
+        for a in range(2):
+            m_data = manager_rollouts[a]
+            if not m_data or 'goals' not in m_data:
+                continue
+            raw_goals = m_data['goals'].detach()
+            msg_onehot, _, logits = self.comm_channels[a].encode(raw_goals)
+            reconstructed = self.comm_channels[a].decode(msg_onehot)
+            recon_loss = F.mse_loss(reconstructed, raw_goals)
+
+            probs = F.softmax(logits, dim=-1)
+            sender_entropy = -(probs * (probs + 1e-10).log()).sum(dim=-1).mean()
+            comm_loss = recon_loss - 0.05 * sender_entropy
+
+            self.optimizer.zero_grad()
+            comm_loss.backward()
+            nn.utils.clip_grad_norm_(self.comm_channels[a].parameters(), 1.0)
+            self.optimizer.step()
+
+            all_stats['comm_recon_loss'].append(recon_loss.item())
+            all_stats['comm_sender_entropy'].append(sender_entropy.item())
+
         return {k: np.mean(v) for k, v in all_stats.items()}
 
     def train(self, output_dir='outputs', wandb_run=None):

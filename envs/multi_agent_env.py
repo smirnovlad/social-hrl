@@ -58,7 +58,7 @@ class TwoAgentCorridorEnv(MiniGridEnv):
 
         # Create walls to form two rooms with a corridor
         for y in range(1, height - 1):
-            if y < mid_y - 0 or y > mid_y + 0:  # Corridor is 1 cell high
+            if y < mid_y - 1 or y > mid_y + 1:  # Corridor is 3 cells high
                 for x in [corridor_start, corridor_end - 1]:
                     if 1 <= x < width - 1:
                         self.grid.set(x, y, Wall())

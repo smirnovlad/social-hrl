@@ -533,6 +533,27 @@ class HRLTrainer:
                             for k, v in stats.items():
                                 all_stats[f'manager_{k}'].append(v)
 
+            # Communication channel reconstruction loss
+            # This is the ONLY way the sender/decoder get gradients
+            if m_data and m_data.get('goals') is not None:
+                raw_goals = m_data['goals'].detach()
+                msg_onehot, _, logits = self.comm_channel.encode(raw_goals)
+                reconstructed = self.comm_channel.decode(msg_onehot)
+                recon_loss = F.mse_loss(reconstructed, raw_goals)
+
+                # Sender entropy bonus to encourage diverse messages
+                probs = F.softmax(logits, dim=-1)
+                sender_entropy = -(probs * (probs + 1e-10).log()).sum(dim=-1).mean()
+                comm_loss = recon_loss - 0.05 * sender_entropy
+
+                self.worker_optimizer.zero_grad()
+                comm_loss.backward()
+                nn.utils.clip_grad_norm_(self.comm_channel.parameters(), self.max_grad_norm)
+                self.worker_optimizer.step()
+
+                all_stats['comm_recon_loss'].append(recon_loss.item())
+                all_stats['comm_sender_entropy'].append(sender_entropy.item())
+
         return {k: np.mean(v) for k, v in all_stats.items()}
 
     # ------------------------------------------------------------------
