@@ -400,9 +400,10 @@ class HRLTrainer:
                         m_done_buf[i][-1] = torch.tensor(1.0, device=self.device)
                     elif self.mode == 'continuous' and m_done_buf[i]:
                         m_done_buf[i][-1] = 1.0
-                    # Don't zero manager_extrinsic_reward here — it carries the
-                    # terminal reward which belongs to the last goal period. It will
-                    # be flushed into m_rew_buf at the next goal decision (after reset).
+                    # Zero manager reward — the terminal step reward is a small
+                    # fraction of the total period reward and leaving it causes
+                    # it to leak into the next episode's first transition as done=0.
+                    manager_extrinsic_reward[i] = 0
 
             steps_since_goal += 1
             obs = next_obs_t

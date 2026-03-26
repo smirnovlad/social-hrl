@@ -172,6 +172,9 @@ class TwoAgentCorridorEnv(MiniGridEnv):
         # Randomly decide who moves first to avoid bias
         order = [0, 1] if np.random.random() > 0.5 else [1, 0]
 
+        # Capture pre-step done state for coordination bonus detection
+        prev_both_done = all(self.agent_dones)
+
         obs_list = [None, None]
         reward_list = [0.0, 0.0]
         done_list = [False, False]
@@ -182,12 +185,8 @@ class TwoAgentCorridorEnv(MiniGridEnv):
             reward_list[idx] = rew
             done_list[idx] = done
 
-        # Coordination bonus: only on the step where BOTH agents become done
-        both_done_now = all(done_list)
-        just_coordinated = both_done_now and any(
-            reward_list[i] == 1.0 for i in range(2)  # at least one just finished this step
-        )
-        if just_coordinated:
+        # Coordination bonus: only on the exact step both become done
+        if all(done_list) and not prev_both_done:
             reward_list = [r + 0.5 for r in reward_list]
 
         terminated = all(done_list)

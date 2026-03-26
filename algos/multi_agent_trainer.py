@@ -114,9 +114,10 @@ class MultiAgentTrainer:
             list(self.shared_critic.parameters())
         )
         self.optimizer = torch.optim.Adam(main_params, lr=ppo_cfg['lr'], eps=1e-5)
-        self.comm_optimizer = torch.optim.Adam(
-            self.comm_channels.parameters(), lr=ppo_cfg['lr'], eps=1e-5
-        )
+        self.comm_optimizers = [
+            torch.optim.Adam(self.comm_channels[a].parameters(), lr=ppo_cfg['lr'], eps=1e-5)
+            for a in range(2)
+        ]
 
         # Config
         self.gamma = ppo_cfg['gamma']
@@ -333,8 +334,7 @@ class MultiAgentTrainer:
                     for a in range(2):
                         if m_done_buf[a][env_idx]:
                             m_done_buf[a][env_idx][-1] = 1.0
-                    # Don't zero manager_ext_reward — terminal reward belongs to
-                    # last goal period and will flush at next goal decision
+                        manager_ext_reward[a][env_idx] = 0
 
             steps_since_goal += 1
             self.obs = next_obs_t
@@ -467,10 +467,10 @@ class MultiAgentTrainer:
             sender_entropy = -(probs * (probs + 1e-10).log()).sum(dim=-1).mean()
             comm_loss = recon_loss - 0.05 * sender_entropy
 
-            self.comm_optimizer.zero_grad()
+            self.comm_optimizers[a].zero_grad()
             comm_loss.backward()
             nn.utils.clip_grad_norm_(self.comm_channels[a].parameters(), 1.0)
-            self.comm_optimizer.step()
+            self.comm_optimizers[a].step()
 
             all_stats['comm_recon_loss'].append(recon_loss.item())
             all_stats['comm_sender_entropy'].append(sender_entropy.item())
