@@ -297,9 +297,9 @@ class MultiAgentTrainer:
                 next_obs[1].append(obs_b)
                 rewards[0][env_idx] = rew_a
                 rewards[1][env_idx] = rew_b
-                dones[env_idx] = done
+                dones[env_idx] = done or truncated
 
-                if done:
+                if done or truncated:
                     (obs_a, obs_b), _ = env.reset()
                     next_obs[0][-1] = obs_a
                     next_obs[1][-1] = obs_b
@@ -555,6 +555,7 @@ class MultiAgentTrainer:
             'goal_projections': self.goal_projections.state_dict(),
             'shared_critic': self.shared_critic.state_dict(),
             'optimizer': self.optimizer.state_dict(),
+            'comm_optimizers': [opt.state_dict() for opt in self.comm_optimizers],
         }
         torch.save(state, path)
         print(f"Saved checkpoint to {path}")
@@ -568,5 +569,8 @@ class MultiAgentTrainer:
         self.goal_projections.load_state_dict(state['goal_projections'])
         self.shared_critic.load_state_dict(state['shared_critic'])
         self.optimizer.load_state_dict(state['optimizer'])
+        if 'comm_optimizers' in state:
+            for a in range(2):
+                self.comm_optimizers[a].load_state_dict(state['comm_optimizers'][a])
         self.global_step = state['global_step']
         print(f"Loaded checkpoint from {path} (step {self.global_step})")
