@@ -4,6 +4,7 @@ Usage:
     python scripts/train.py --mode flat --seed 42
     python scripts/train.py --mode continuous --seed 42
     python scripts/train.py --mode discrete --seed 42
+    python scripts/train.py --mode social --seed 42
 """
 
 import argparse
@@ -19,6 +20,7 @@ import wandb
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from algos.hrl_trainer import HRLTrainer
+from algos.multi_agent_trainer import MultiAgentTrainer
 from analysis.goal_metrics import compute_all_metrics
 
 
@@ -30,7 +32,7 @@ def load_config(config_path='configs/default.yaml'):
 def main():
     parser = argparse.ArgumentParser(description='Social HRL Training')
     parser.add_argument('--mode', type=str, default='flat',
-                        choices=['flat', 'continuous', 'discrete'],
+                        choices=['flat', 'continuous', 'discrete', 'social'],
                         help='Training mode')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--total-timesteps', type=int, default=None,
@@ -92,7 +94,10 @@ def main():
     print(f"=" * 60)
 
     # Train
-    trainer = HRLTrainer(config, mode=args.mode, device=args.device)
+    if args.mode == 'social':
+        trainer = MultiAgentTrainer(config, device=args.device)
+    else:
+        trainer = HRLTrainer(config, mode=args.mode, device=args.device)
     results = trainer.train(output_dir=output_dir, wandb_run=run)
 
     # Compute and save metrics
