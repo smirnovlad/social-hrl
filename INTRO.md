@@ -31,27 +31,26 @@ Four conditions, all at 1M timesteps × 3 random seeds:
 
 | | Continuous | Discrete |
 |---|-----------|----------|
-| Goal entropy | 0.0 (collapsed) | **3.99** (58% of max) |
-| Unique messages | 0 | **407** |
+| Goal entropy | 0.0 (collapsed) | **6.73** (97.5% of max) |
+| Unique messages | 0 | **1000** (100%) |
 
-The Gumbel-Softmax bottleneck maintains diverse goals where continuous representations collapse. Validated on two environments.
+The Gumbel-Softmax bottleneck achieves near-maximum entropy where continuous representations collapse completely.
 
 ### H2: Social pressure → better goals — NEGATIVE RESULT (interesting)
 
 | | Discrete (solo) | Social (2 agents) |
 |---|----------------|-------------------|
-| Goal entropy | **3.99** | 3.32 |
-| Unique messages | **407** | 345 |
-| Temporal extent | 1.35 | **2.17** (+61%) |
-| Cross-seed consistency | std=129 | **std=17** (7.6x more stable) |
+| Goal entropy | **6.73** (97.5% max) | 6.21 (89.8% max) |
+| Unique messages | **1000** (100%) | **1000** (100%) |
+| Coverage | **0.99%** | 0.49% |
 
-Social pressure **decreases** goal diversity but **increases** goal stability. Agents converge on a compact, efficient vocabulary for coordination rather than exploring the full message space. This is consistent with emergent communication literature (Chaabouni et al., ACL 2020).
+Both conditions use all 1000 possible messages, but social concentrates usage on a subset (lower entropy). Social pressure acts as a *frequency concentrator* — agents develop preferred messages for coordination rather than distributing goals uniformly.
 
-**Key insight**: "Good" goals for coordination ≠ "diverse" goals. Social interaction regularizes toward efficiency, not richness.
+**Key insight**: "Good" goals for coordination ≠ "diverse" goals. Social interaction regularizes toward efficiency, not maximum entropy.
 
 ### H3: Transfer — Inconclusive
 
-Frozen managers from both conditions achieved 0% on a harder env. Source models were too weak (~1-2% success on training env).
+Frozen managers from both conditions achieved 0% on a harder env. Source models at ~51% corridor success don't produce representations that generalize.
 
 ### H4: Channel capacity sweep — Not tested yet
 
@@ -117,4 +116,3 @@ All runs logged to: **mbzuai-research/social-hrl**
 
 1. **H4 bottleneck sweep** (optional, ~2 hours GPU time)
 2. **15-minute presentation**
-3. `git push` (17 commits ahead of origin)
