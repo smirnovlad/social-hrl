@@ -182,19 +182,23 @@ class TwoAgentCorridorEnv(MiniGridEnv):
             reward_list[idx] = rew
             done_list[idx] = done
 
-        # Coordination bonus: if both agents finish, extra reward
-        if all(done_list):
+        # Coordination bonus: only on the step where BOTH agents become done
+        both_done_now = all(done_list)
+        just_coordinated = both_done_now and any(
+            reward_list[i] == 1.0 for i in range(2)  # at least one just finished this step
+        )
+        if just_coordinated:
             reward_list = [r + 0.5 for r in reward_list]
 
+        terminated = all(done_list)
         truncated = self.step_count >= self.max_steps
-        all_done = all(done_list) or truncated
 
         info = {
             'agent_dones': done_list,
             'agent_positions': list(self.agent_positions),
         }
 
-        return tuple(obs_list), tuple(reward_list), all_done, truncated, info
+        return tuple(obs_list), tuple(reward_list), terminated, truncated, info
 
 
 class SingleAgentCorridorEnv(gym.Wrapper):
@@ -218,9 +222,9 @@ class SingleAgentCorridorEnv(gym.Wrapper):
 
     def step(self, action):
         # Step agent A only, agent B is frozen (action=0 = turn left = effectively idle)
-        (obs_a, _), (rew_a, _), all_done, truncated, info = self.env.step((action, 0))
-        terminated = self.env.agent_dones[0]
-        return obs_a, rew_a, terminated, truncated or (all_done and not terminated), info
+        (obs_a, _), (rew_a, _), _terminated, truncated, info = self.env.step((action, 0))
+        agent_a_done = self.env.agent_dones[0]
+        return obs_a, rew_a, agent_a_done, truncated, info
 
 
 def make_corridor_vec_env(num_envs, seed=0, max_steps=200, single_agent=True):

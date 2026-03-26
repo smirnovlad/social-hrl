@@ -145,7 +145,10 @@ class HRLTrainer:
                     message_length=comm_cfg['message_length'],
                     tau=comm_cfg['tau_start'],
                 ).to(self.device)
-                worker_params += list(self.comm_channel.parameters())
+                # Comm channel gets its own optimizer to avoid stale gradient corruption
+                self.comm_optimizer = torch.optim.Adam(
+                    self.comm_channel.parameters(), lr=ppo_cfg['lr'], eps=1e-5
+                )
 
                 self.manager_optimizer = torch.optim.Adam(
                     self.manager.parameters(), lr=ppo_cfg['lr'] * 0.1, eps=1e-5
@@ -392,11 +395,14 @@ class HRLTrainer:
                     episode_returns.append(episode_rewards[i])
                     episode_rewards[i] = 0
                     steps_since_goal[i] = 0
-                    manager_extrinsic_reward[i] = 0
+                    # Mark last manager entry as terminal
                     if self.mode == 'discrete' and m_done_buf[i]:
                         m_done_buf[i][-1] = torch.tensor(1.0, device=self.device)
                     elif self.mode == 'continuous' and m_done_buf[i]:
                         m_done_buf[i][-1] = 1.0
+                    # Don't zero manager_extrinsic_reward here — it carries the
+                    # terminal reward which belongs to the last goal period. It will
+                    # be flushed into m_rew_buf at the next goal decision (after reset).
 
             steps_since_goal += 1
             obs = next_obs_t
@@ -554,10 +560,10 @@ class HRLTrainer:
                 sender_entropy = -(probs * (probs + 1e-10).log()).sum(dim=-1).mean()
                 comm_loss = recon_loss - 0.05 * sender_entropy
 
-                self.worker_optimizer.zero_grad()
+                self.comm_optimizer.zero_grad()
                 comm_loss.backward()
                 nn.utils.clip_grad_norm_(self.comm_channel.parameters(), self.max_grad_norm)
-                self.worker_optimizer.step()
+                self.comm_optimizer.step()
 
                 all_stats['comm_recon_loss'].append(recon_loss.item())
                 all_stats['comm_sender_entropy'].append(sender_entropy.item())
@@ -671,12 +677,13 @@ class HRLTrainer:
                 state['manager'] = self.manager.state_dict()
                 state['manager_optimizer'] = self.manager_optimizer.state_dict()
                 state['comm_channel'] = self.comm_channel.state_dict()
+                state['comm_optimizer'] = self.comm_optimizer.state_dict()
 
         torch.save(state, path)
         print(f"Saved checkpoint to {path}")
 
     def load(self, path):
-        state = torch.load(path, map_location=self.device)
+        state = torch.load(path, map_location=self.device, weights_only=False)
 
         if self.mode == 'flat':
             self.flat_policy.load_state_dict(state['flat_policy'])

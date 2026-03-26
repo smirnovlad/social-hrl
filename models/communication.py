@@ -60,7 +60,7 @@ class CommunicationChannel(nn.Module):
 
         self.vocab_size = vocab_size
         self.message_length = message_length
-        self.tau = tau
+        self.register_buffer('tau', torch.tensor(float(tau)))
 
         # Sender: continuous goal -> discrete message
         self.sender = nn.Sequential(
@@ -106,12 +106,14 @@ class CommunicationChannel(nn.Module):
 
         # Apply Gumbel-Softmax to each token position independently
         samples = []
+        indices = []
         for i in range(self.message_length):
             sample = gumbel_softmax(logits[:, i], tau=self.tau, hard=hard)
             samples.append(sample)
+            indices.append(sample.argmax(dim=-1))
 
         message_onehot = torch.cat(samples, dim=-1)  # (batch, L * K)
-        message_indices = logits.argmax(dim=-1)  # (batch, L)
+        message_indices = torch.stack(indices, dim=-1)  # (batch, L)
 
         return message_onehot, message_indices, logits
 
@@ -141,4 +143,4 @@ class CommunicationChannel(nn.Module):
 
     def set_tau(self, tau):
         """Update Gumbel-Softmax temperature."""
-        self.tau = tau
+        self.tau.fill_(tau)

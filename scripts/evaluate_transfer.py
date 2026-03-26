@@ -38,7 +38,7 @@ class TransferTrainer:
         self.source_mode = source_mode
 
         # Load checkpoint
-        state = torch.load(checkpoint_path, map_location=self.device)
+        state = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         config = state['config']
 
         hidden_dim = config['encoder']['hidden_dim']

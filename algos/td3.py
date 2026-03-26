@@ -9,7 +9,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import torch.nn.functional as nnf
 import copy
 
 
@@ -151,7 +150,7 @@ class ManagerTD3:
             goal = self.actor(state)
             if add_noise:
                 noise = torch.randn_like(goal) * self.exploration_noise
-                goal = goal + noise
+                goal = torch.clamp(goal + noise, -1.0, 1.0)
         return goal
 
     def add_transition(self, state, goal, reward, next_state, done):
@@ -190,7 +189,7 @@ class ManagerTD3:
             noise = (torch.randn_like(goals) * self.policy_noise).clamp(
                 -self.noise_clip, self.noise_clip
             )
-            next_goals = self.actor_target(next_states) + noise
+            next_goals = torch.clamp(self.actor_target(next_states) + noise, -1.0, 1.0)
 
             # Target Q-values
             target_q1, target_q2 = self.critic_target(next_states, next_goals)
@@ -217,6 +216,7 @@ class ManagerTD3:
             actor_loss = -self.critic.q1_forward(states, self.actor(states)).mean()
 
             self.actor_optimizer.zero_grad()
+            self.critic_optimizer.zero_grad()  # prevent stale critic gradients
             actor_loss.backward()
             nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
             self.actor_optimizer.step()

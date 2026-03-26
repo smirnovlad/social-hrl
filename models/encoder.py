@@ -51,7 +51,10 @@ class MinigridEncoder(nn.Module):
             features: (batch, hidden_dim) float tensor.
         """
         # Minigrid gives (H, W, C), conv expects (C, H, W)
+        # Channels: object_type (0-10), color (0-5), state (0-2)
         if obs.dim() == 3:
             obs = obs.unsqueeze(0)
-        x = obs.permute(0, 3, 1, 2).float() / 10.0
+        x = obs.permute(0, 3, 1, 2).float()
+        channel_max = torch.tensor([10.0, 5.0, 2.0], device=x.device).view(1, 3, 1, 1)
+        x = x / channel_max.clamp(min=1.0)
         return self.fc(self.conv(x))
