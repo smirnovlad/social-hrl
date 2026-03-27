@@ -1,0 +1,146 @@
+\documentclass[10pt,twocolumn]{article}
+
+\usepackage[margin=0.75in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{natbib}
+\usepackage{enumitem}
+\usepackage{caption}
+
+\setlength{\parskip}{0.3em}
+\setlength{\parindent}{0em}
+\setlength{\bibsep}{0.2em}
+
+\title{\textbf{Social Interaction as Regularization\\for Hierarchical Reinforcement Learning}\\[0.3em]
+\large ML8103 Sequential Decision Making --- Progress Report}
+
+\author{Vladislav Smirnov \qquad Mirat Aubakirov\\[0.3em]
+\textit{Mohamed bin Zayed University of Artificial Intelligence}}
+
+\date{March 2026}
+
+\begin{document}
+\maketitle
+
+\section{Introduction}
+
+In hierarchical RL, a manager network picks subgoals and a worker network executes low-level actions. The common failure case is \textbf{goal collapse}: the manager learns to output the same goal every time, which makes the hierarchy useless~\citep{nachum2018hiro, vezhnevets2017feudal}.
+
+We try two things to fix this. First, we route goals through a \textbf{discrete bottleneck} (Gumbel-Softmax) that forces the manager to pick from a finite set of 1000 messages instead of outputting a continuous vector. Second, we add a \textbf{second agent} that reads the same messages, hoping that the need to coordinate would push goals toward something meaningful.
+
+The second idea did not work the way we expected. The discrete bottleneck alone already prevents collapse almost perfectly. Adding a partner actually reduces goal diversity slightly.
+
+\section{Method}
+
+\subsection{Environment}
+
+We built a custom 11$\times$11 MiniGrid corridor environment. Two rooms are connected by a 3-cell-wide passage. The agent starts top-left and has to reach the bottom-right room. Observations are partial (7$\times$7 view). The agent gets $-0.01$ per step and $+1.0$ for reaching the goal. In the two-agent version, agents start in opposite rooms and each has to cross to the other side. They get a $+0.5$ bonus if both finish.
+
+\subsection{Conditions}
+
+Table~\ref{tab:conditions} lists the four setups we compared. All were trained for 1M steps with 3 seeds each.
+
+\begin{table}[h]
+\centering
+\small
+\caption{The four conditions. GS = Gumbel-Softmax.}
+\label{tab:conditions}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Condition & Manager & Goals & Agents \\
+\midrule
+Flat PPO & None & --- & 1 \\
+HRL Continuous & TD3 & $\mathbf{g} \in [-1,1]^{16}$ & 1 \\
+HRL Discrete & PPO+GS & $\mathbf{m} \in \{1,...,10\}^3$ & 1 \\
+HRL Social & PPO+GS & $\mathbf{m} \in \{1,...,10\}^3$ & 2 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Architecture}
+
+A 3-layer CNN (16/32/64 channels, per-channel normalization) maps the 7$\times$7$\times$3 input to 128-dim features. The manager outputs a 16-dim goal every 10 steps. In discrete and social modes, the goal goes through a communication channel: a sender maps it to 3 categorical distributions over 10 tokens each (so 1000 possible messages total), and a decoder reconstructs a continuous goal for the worker. We use Gumbel-Softmax~\citep{jang2017gumbel} with temperature annealing from 1.0 to 0.1. The channel has its own optimizer, trained with a reconstruction loss plus a small entropy bonus.
+
+In social mode, each agent's manager also receives the other agent's last message. A shared critic $V(o_A, o_B)$ sees both observations during training.
+
+\subsection{Metrics}
+
+We measure \textbf{goal entropy} (Shannon entropy of the message distribution; max is $3\ln 10 \approx 6.91$), \textbf{unique messages} (how many of the 1000 possible messages were actually used), and \textbf{coverage} (what fraction of the vocabulary was observed).
+
+\section{Results}
+
+\subsection{H1: Does the discrete bottleneck help?}
+
+Yes. Table~\ref{tab:h1} shows the comparison. The continuous manager (TD3) collapses to a single fixed output --- entropy is literally zero. With the Gumbel-Softmax bottleneck, the manager uses all 1000 messages and reaches 97.5\% of maximum entropy. Both conditions solve the task at the same rate (${\sim}51\%$), so the bottleneck adds diversity for free.
+
+\begin{table}[h]
+\centering
+\small
+\caption{Continuous vs.\ discrete goals on the corridor task.}
+\label{tab:h1}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Metric & Continuous & Discrete \\
+\midrule
+Goal reach rate & 51.2\% & 51.1\% \\
+Goal entropy & 0.000 & \textbf{6.73} \\
+\% of max entropy & 0\% & \textbf{97.5\%} \\
+Unique messages & 0 & \textbf{1000/1000} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{H2: Does a partner agent help more?}
+
+No. Table~\ref{tab:h2} shows the numbers. The social condition uses all 1000 messages too, but its entropy is lower (89.8\% vs 97.5\%). This means some messages get used much more often than others --- the distribution is less uniform.
+
+\begin{table}[h]
+\centering
+\small
+\caption{Discrete (solo) vs.\ social (two agents).}
+\label{tab:h2}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Metric & Discrete & Social \\
+\midrule
+Goal reach rate & 51.1\% & 45.6\% \\
+Goal entropy & \textbf{6.73} & 6.21 \\
+\% of max entropy & \textbf{97.5\%} & 89.8\% \\
+Unique messages & 1000 & 1000 \\
+Coverage & \textbf{0.99\%} & 0.49\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+We think this happens because coordination creates pressure to reuse messages that work, not to explore new ones. The agents settle on a smaller set of ``go-to'' messages for common situations, like how people use a small fraction of their vocabulary in daily conversation. This matches what Chaabouni et al.~\citeyearpar{chaabouni2020compositionality} found in emergent communication: agents under coordination pressure develop efficient codes, not diverse ones.
+
+\subsection{H3: Transfer}
+
+We froze trained managers and tried to train fresh workers on a different MiniGrid task (KeyCorridorS4R3, which has keys and doors). Both conditions got 0\%. The encoder was trained on our corridor layout and produces garbage features on a completely different environment. A proper transfer test would need environments from the same family.
+
+\section{Discussion}
+
+The discrete bottleneck works well --- it gets 97.5\% of max entropy with no performance cost. But the social pressure hypothesis did not pan out. Adding a partner makes the message distribution less uniform, not more diverse.
+
+One problem with our setup: flat PPO already solves the corridor at 99.3\%, while all HRL conditions plateau around 45--51\%. The task is too simple to need hierarchy. Our results say something about goal diversity, but we cannot yet show that this diversity actually helps with harder tasks.
+
+\section{Next steps}
+
+\begin{enumerate}[nosep]
+    \item \textbf{H4: Bottleneck sweep.} Try different vocabulary sizes ($K \in \{3, 5, 10, 25\}$) and message lengths ($L \in \{1, 2, 3\}$) to see if there is a sweet spot.
+    \item \textbf{Harder environment.} Find a task where flat PPO actually struggles, so we can check whether goal diversity translates to better performance.
+    \item \textbf{Same-family transfer.} Test transfer between corridor variants with different sizes or layouts, where the encoder features still make sense.
+\end{enumerate}
+
+\section{Difficulties}
+
+The hardest part was finding the right environment. Our corridor is too easy for flat PPO, so HRL cannot show a performance advantage. We also had to make a single-agent version of the corridor so we could fairly compare discrete (1 agent) and social (2 agents) on the same layout and reward structure. Finally, getting the communication channel to actually learn required careful gradient isolation --- the sender and decoder need their own optimizer and a reconstruction loss, otherwise the channel just outputs noise.
+
+{\small
+\bibliographystyle{plainnat}
+\bibliography{references}
+}
+
+\end{document}
