@@ -85,4 +85,4 @@ Mode: social
 - PPO: lr=3e-4, 8 envs, 128 steps/rollout, 4 epochs
 - Gumbel tau: 1.0 → 0.1 over 200K steps
 - TD3: lr=3e-4, tau=0.005, replay buffer 200K, warmup 1K
-- Corridor: 11x11, 3-cell corridor, max_steps=200
+- Corridor: 11x11, 3-cell corridor, max_steps=500

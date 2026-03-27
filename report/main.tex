@@ -36,7 +36,7 @@ The second idea did not work the way we expected. The discrete bottleneck alone 
 
 \subsection{Environment}
 
-We built a custom 11$\times$11 MiniGrid corridor environment (Figure~\ref{fig:arch}a). Two rooms are connected by a 3-cell-wide passage. The agent starts top-left and has to reach the bottom-right room. Observations are partial (7$\times$7 view). The agent gets $-0.01$ per step and $+1.0$ for reaching the goal. In the two-agent version, agents start in opposite rooms and each has to cross to the other side. They get a $+0.5$ bonus if both finish. Max episode length is 200 steps.
+We built a custom 11$\times$11 MiniGrid corridor environment (Figure~\ref{fig:arch}a). Two rooms are connected by a 3-cell-wide passage. The agent starts top-left and has to reach the bottom-right room. Observations are partial (7$\times$7 view). The agent gets $-0.01$ per step and $+1.0$ for reaching the goal. In the two-agent version, agents start in opposite rooms and each has to cross to the other side. They get a $+0.5$ bonus if both finish. Max episode length is 500 steps.
 
 We picked this environment because the corridor creates a natural bottleneck where agents have to pass each other, which is where coordination should matter. The downside (which we only discovered after running experiments) is that flat PPO solves it trivially --- 99.3\% success from the start. More on this in Section~\ref{sec:discussion}.
 
