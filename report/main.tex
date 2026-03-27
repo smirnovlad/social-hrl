@@ -26,21 +26,23 @@
 
 \section{Introduction}
 
-In hierarchical RL, a manager network picks subgoals and a worker network executes low-level actions. The common failure case is \textbf{goal collapse}: the manager learns to output the same goal every time, which makes the hierarchy useless~\citep{nachum2018hiro, vezhnevets2017feudal}.
+In hierarchical RL, a manager network picks subgoals and a worker network executes low-level actions~\citep{nachum2018hiro, vezhnevets2017feudal, bacon2017option}. The common failure case is \textbf{goal collapse}: the manager learns to output the same goal every time, which makes the hierarchy useless.
 
 We try two things to fix this. First, we route goals through a \textbf{discrete bottleneck} (Gumbel-Softmax) that forces the manager to pick from a finite set of 1000 messages instead of outputting a continuous vector. Second, we add a \textbf{second agent} that reads the same messages, hoping that the need to coordinate would push goals toward something meaningful.
 
-The second idea did not work the way we expected. The discrete bottleneck alone already prevents collapse almost perfectly. Adding a partner actually reduces goal diversity slightly.
+The second idea did not work the way we expected. The discrete bottleneck alone already prevents collapse almost perfectly. Adding a partner actually reduces goal diversity slightly --- agents develop efficient codes rather than diverse ones.
 
 \section{Method}
 
 \subsection{Environment}
 
-We built a custom 11$\times$11 MiniGrid corridor environment. Two rooms are connected by a 3-cell-wide passage. The agent starts top-left and has to reach the bottom-right room. Observations are partial (7$\times$7 view). The agent gets $-0.01$ per step and $+1.0$ for reaching the goal. In the two-agent version, agents start in opposite rooms and each has to cross to the other side. They get a $+0.5$ bonus if both finish.
+We built a custom 11$\times$11 MiniGrid corridor environment (Figure~\ref{fig:arch}a). Two rooms are connected by a 3-cell-wide passage. The agent starts top-left and has to reach the bottom-right room. Observations are partial (7$\times$7 view). The agent gets $-0.01$ per step and $+1.0$ for reaching the goal. In the two-agent version, agents start in opposite rooms and each has to cross to the other side. They get a $+0.5$ bonus if both finish. Max episode length is 200 steps.
+
+We picked this environment because the corridor creates a natural bottleneck where agents have to pass each other, which is where coordination should matter. The downside (which we only discovered after running experiments) is that flat PPO solves it trivially --- 99.3\% success from the start. More on this in Section~\ref{sec:discussion}.
 
 \subsection{Conditions}
 
-Table~\ref{tab:conditions} lists the four setups we compared. All were trained for 1M steps with 3 seeds each.
+Table~\ref{tab:conditions} lists the four setups we compared. All were trained for 1M timesteps across 8 parallel environments, with 3 random seeds each (42, 123, 7).
 
 \begin{table}[h]
 \centering
@@ -59,17 +61,97 @@ HRL Social & PPO+GS & $\mathbf{m} \in \{1,...,10\}^3$ & 2 \\
 \end{tabular}
 \end{table}
 
+To make the comparison between discrete and social fair, we created a single-agent version of the same corridor layout. Both conditions see the same grid, same observations, same rewards. The only difference is whether a second agent is present.
+
 \subsection{Architecture}
 
-A 3-layer CNN (16/32/64 channels, per-channel normalization) maps the 7$\times$7$\times$3 input to 128-dim features. The manager outputs a 16-dim goal every 10 steps. In discrete and social modes, the goal goes through a communication channel: a sender maps it to 3 categorical distributions over 10 tokens each (so 1000 possible messages total), and a decoder reconstructs a continuous goal for the worker. We use Gumbel-Softmax~\citep{jang2017gumbel} with temperature annealing from 1.0 to 0.1. The channel has its own optimizer, trained with a reconstruction loss plus a small entropy bonus.
+Figure~\ref{fig:arch}b shows how the pieces fit together. A 3-layer CNN (16/32/64 channels) maps the 7$\times$7$\times$3 MiniGrid observation to 128-dim features, with per-channel normalization (dividing by the max value for each channel: 10 for object type, 5 for color, 2 for state).
 
-In social mode, each agent's manager also receives the other agent's last message. A shared critic $V(o_A, o_B)$ sees both observations during training.
+The \textbf{manager} is a small MLP that outputs a 16-dim goal vector every $c=10$ worker steps. In continuous mode, it uses TD3~\citep{nachum2018hiro} with tanh output. In discrete mode, it uses PPO~\citep{schulman2017ppo} with a Gaussian policy.
+
+The \textbf{communication channel} sits between the manager and worker in discrete/social modes. It has three parts:
+\begin{itemize}[nosep]
+    \item A \textit{sender} (linear layer) that maps the 16-dim goal to $3 \times 10 = 30$ logits, reshaped as 3 categorical distributions over 10 tokens.
+    \item \textit{Gumbel-Softmax}~\citep{jang2017gumbel} sampling at each position --- hard one-hot in the forward pass, soft gradients backward. Temperature anneals from 1.0 (exploratory) to 0.1 (nearly hard) over 200K steps.
+    \item A \textit{decoder} (linear layer) that maps the 30-dim one-hot message back to a 16-dim goal for the worker.
+\end{itemize}
+
+The channel is trained with MSE reconstruction loss (decoded goal vs.\ raw goal) plus a sender entropy bonus (coefficient 0.05). It has its own Adam optimizer to keep its gradients separate from the rest of the network.
+
+The \textbf{worker} is a goal-conditioned policy that receives concatenated encoder features and the decoded goal. Its reward mixes an intrinsic term ($-\|\text{proj}(\phi(s)) - g\|$, pushing it to match the goal direction) with the extrinsic environment reward, both weighted equally.
+
+In \textbf{social mode}, two copies of this whole stack operate in the same environment. Each agent's manager gets the other agent's previous message (embedded and concatenated to its input). A shared centralized critic $V(o_A, o_B)$ sees both agents' observations for more stable training (CTDE paradigm from~\citet{lowe2017maddpg}). The idea that agents can learn from each other's behavior has also been explored in opponent modeling~\citep{foerster2018lola}, though we focus on communication rather than policy inference.
+
+\begin{figure}[t]
+\centering
+\small
+\begin{verbatim}
+(a) Corridor layout (11x11)
+  ###########
+  #...#.#...#
+  #.A.#.#...#   A = agent start
+  #...#.#...#   G = goal
+  #.........#   3-cell corridor
+  #.........#
+  #.........#
+  #...#.#.G.#
+  #...#.#...#
+  ###########
+
+(b) Discrete/Social architecture
+  obs -> CNN -> features
+                  |
+          Manager (every 10 steps)
+                  |
+            raw goal (R^16)
+                  |
+        Sender -> Gumbel-Softmax
+                  |
+          message m in {1..10}^3
+                  |
+              Decoder
+                  |
+         decoded goal -> Worker -> action
+\end{verbatim}
+\caption{(a) The corridor environment. (b) Data flow in discrete/social modes. In social mode, the partner's message is also fed to the manager.}
+\label{fig:arch}
+\end{figure}
 
 \subsection{Metrics}
 
-We measure \textbf{goal entropy} (Shannon entropy of the message distribution; max is $3\ln 10 \approx 6.91$), \textbf{unique messages} (how many of the 1000 possible messages were actually used), and \textbf{coverage} (what fraction of the vocabulary was observed).
+We track three goal quality metrics:
+\begin{itemize}[nosep]
+    \item \textbf{Goal entropy}: Shannon entropy of the message frequency distribution. Maximum is $3\ln 10 \approx 6.91$ (uniform over all 1000 messages).
+    \item \textbf{Unique messages}: how many of the 1000 possible messages appeared at least once during training.
+    \item \textbf{Coverage}: fraction of messages that were used more than once (filters out one-off noise).
+\end{itemize}
+
+We also report task performance (goal reach rate), though as we will see, it is less informative on this particular environment.
 
 \section{Results}
+
+\subsection{Task performance}
+
+Table~\ref{tab:task} shows task success rates across conditions.
+
+\begin{table}[h]
+\centering
+\small
+\caption{Task performance on the corridor environment.}
+\label{tab:task}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Condition & Goal reach rate & Mean return \\
+\midrule
+Flat PPO & 99.3\% $\pm$ 0.7\% & 0.837 \\
+HRL Continuous & 51.2\% $\pm$ 7.4\% & $-$0.430 \\
+HRL Discrete & 51.1\% $\pm$ 2.6\% & $-$0.431 \\
+HRL Social & 45.6\% $\pm$ 3.5\% & $-$0.582 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Flat PPO solves the corridor almost immediately. The HRL conditions all plateau around 45--51\%. The hierarchy adds overhead (manager decisions every 10 steps, intrinsic reward optimization, communication channel) without providing any benefit on a task this simple. The interesting comparison is in goal quality, not task performance.
 
 \subsection{H1: Does the discrete bottleneck help?}
 
@@ -78,7 +160,7 @@ Yes. Table~\ref{tab:h1} shows the comparison. The continuous manager (TD3) colla
 \begin{table}[h]
 \centering
 \small
-\caption{Continuous vs.\ discrete goals on the corridor task.}
+\caption{Continuous vs.\ discrete goals.}
 \label{tab:h1}
 \begin{tabular}{@{}lcc@{}}
 \toprule
@@ -91,6 +173,8 @@ Unique messages & 0 & \textbf{1000/1000} \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+Why does this work? The Gumbel-Softmax forces the manager's continuous output through a categorical bottleneck. Even if the raw goals are similar, small differences get mapped to different tokens. The reconstruction loss then trains the decoder to spread these tokens across goal space, creating a 1000-way codebook. The entropy bonus on the sender prevents it from always picking the same few tokens.
 
 \subsection{H2: Does a partner agent help more?}
 
@@ -118,25 +202,36 @@ We think this happens because coordination creates pressure to reuse messages th
 
 \subsection{H3: Transfer}
 
-We froze trained managers and tried to train fresh workers on a different MiniGrid task (KeyCorridorS4R3, which has keys and doors). Both conditions got 0\%. The encoder was trained on our corridor layout and produces garbage features on a completely different environment. A proper transfer test would need environments from the same family.
+We froze the encoder, manager, and communication channel from the trained discrete and social models (both at ${\sim}51\%$ corridor success), then trained a fresh worker on MiniGrid-KeyCorridorS4R3 --- a different task that requires picking up a key, opening a door, and navigating to a ball.
+
+Both conditions got 0\% success after 500K steps (3 seeds each). The problem is straightforward: our encoder was trained on the corridor layout and has never seen keys, doors, or the KeyCorridor geometry. It produces uninformative features on the new environment, so the frozen manager cannot produce useful goals regardless of how diverse its goal vocabulary is.
+
+A proper transfer test would need environments from the same family --- for example, corridors with different room sizes or obstacle placements, where the encoder's learned features (walls, open space, corridors) would still be relevant.
 
 \section{Discussion}
+\label{sec:discussion}
 
-The discrete bottleneck works well --- it gets 97.5\% of max entropy with no performance cost. But the social pressure hypothesis did not pan out. Adding a partner makes the message distribution less uniform, not more diverse.
+The discrete bottleneck works well. Routing goals through a 1000-message Gumbel-Softmax channel gets 97.5\% of max entropy with zero performance cost compared to continuous goals. This is a simple, effective way to prevent goal collapse.
 
-One problem with our setup: flat PPO already solves the corridor at 99.3\%, while all HRL conditions plateau around 45--51\%. The task is too simple to need hierarchy. Our results say something about goal diversity, but we cannot yet show that this diversity actually helps with harder tasks.
+The social pressure idea did not help. Adding a partner makes the message distribution less uniform, not more diverse. In retrospect this makes sense: when you need someone else to understand your messages, you stick with the ones that already worked. You do not experiment with new ones during a task.
+
+The biggest weakness of our current setup is the environment. Flat PPO gets 99.3\% on the corridor, so there is no room for HRL to show a task performance advantage. All three HRL conditions plateau around 45--51\%, paying the overhead of hierarchy without getting anything back. Our results are about goal diversity metrics, but we have not yet shown that better diversity actually translates to better performance on something hard.
 
 \section{Next steps}
 
 \begin{enumerate}[nosep]
-    \item \textbf{H4: Bottleneck sweep.} Try different vocabulary sizes ($K \in \{3, 5, 10, 25\}$) and message lengths ($L \in \{1, 2, 3\}$) to see if there is a sweet spot.
-    \item \textbf{Harder environment.} Find a task where flat PPO actually struggles, so we can check whether goal diversity translates to better performance.
-    \item \textbf{Same-family transfer.} Test transfer between corridor variants with different sizes or layouts, where the encoder features still make sense.
+    \item \textbf{H4: Bottleneck sweep.} Try different vocabulary sizes ($K \in \{3, 5, 10, 25\}$) and message lengths ($L \in \{1, 2, 3\}$) to see if there is a sweet spot where compression helps versus just having a large codebook.
+    \item \textbf{Harder environment.} Find a task where flat PPO actually struggles --- something with long horizons, keys, doors, or multiple rooms --- so we can check whether goal diversity translates to better task performance.
+    \item \textbf{Same-family transfer.} Test transfer between corridor variants with different sizes or layouts, where the encoder features still make sense. This would give H3 a fair shot.
 \end{enumerate}
 
 \section{Difficulties}
 
-The hardest part was finding the right environment. Our corridor is too easy for flat PPO, so HRL cannot show a performance advantage. We also had to make a single-agent version of the corridor so we could fairly compare discrete (1 agent) and social (2 agents) on the same layout and reward structure. Finally, getting the communication channel to actually learn required careful gradient isolation --- the sender and decoder need their own optimizer and a reconstruction loss, otherwise the channel just outputs noise.
+The hardest part was finding the right environment. We wanted something with a natural hierarchical structure (rooms, corridors) and room for two agents to interact. The corridor environment has both, but it turned out to be too easy for flat PPO. By the time we discovered this, we had already run all experiments on it. A multi-room environment with locked doors (like MiniGrid-KeyCorridorS4R3) would be better, but it does not have a natural two-agent variant.
+
+Getting the communication channel to work took several iterations. The sender and decoder need their own optimizer --- if they share one with the rest of the network, their gradients interfere with the encoder and worker updates. They also need a reconstruction loss; without it, no gradient reaches the sender or decoder at all, and the channel just outputs random tokens. We only caught this after running our first batch of experiments and noticing that goal entropy was much lower than expected.
+
+Making the comparison between discrete and social modes fair required building a single-agent wrapper around the two-agent corridor. Without this, the two conditions would be on different environments (a standard MiniGrid task vs.\ our custom corridor), and any difference in goal metrics could just reflect the different tasks rather than the effect of social pressure.
 
 {\small
 \bibliographystyle{plainnat}
