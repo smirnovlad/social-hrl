@@ -1,114 +1,101 @@
-"""Generate comparison plots for all experiment conditions.
+"""Generate comparison plots for experiment runs.
 
 Usage:
-    python scripts/plot_results.py --experiment-dir outputs/
+    python scripts/plot_results.py --experiment-dir outputs/suites/<suite>/runs \
+        --output-dir outputs/suites/<suite>/plots
 """
 
 import argparse
 import os
 import sys
-import json
-import re
-import numpy as np
+
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from pathlib import Path
-from collections import defaultdict
+import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from experiment_utils import discover_runs, latest_records, load_json
 
 
 def smooth(data, window=50):
     """Simple moving average smoothing."""
     if len(data) < window:
         return data
-    return np.convolve(data, np.ones(window)/window, mode='valid')
+    return np.convolve(data, np.ones(window) / window, mode='valid')
+
+
+def load_run(record):
+    """Load returns and metrics for a discovered run."""
+    data = {'record': record}
+    if os.path.exists(record['returns_path']):
+        data['returns'] = np.load(record['returns_path'])
+    if os.path.exists(record['metrics_path']):
+        data['metrics'] = load_json(record['metrics_path'])
+    return data
 
 
 def find_latest_runs(base_dir):
-    """Find the latest run for each (mode, seed) pair.
-
-    Scans outputs/YYYY-MM-DD/mode_seedN/HH-MM-SS/ structure.
-    Returns dict: {(mode, seed): path_to_latest_run}
-    """
-    runs = {}
-    base = Path(base_dir)
-
-    for returns_file in sorted(base.rglob('returns.npy')):
-        run_dir = returns_file.parent
-        # Parse: outputs/DATE/mode_seedN/TIME/returns.npy
-        parts = run_dir.parts
-        for i, part in enumerate(parts):
-            match = re.match(r'^(flat_corridor|continuous_corridor|flat|continuous|discrete_corridor|discrete|social)_seed(\d+)$', part)
-            if match:
-                mode = match.group(1)
-                seed = int(match.group(2))
-                key = (mode, seed)
-                # Keep the latest (sorted by path, last wins)
-                runs[key] = str(run_dir)
-                break
-
-    return runs
+    """Find the latest run for each condition and seed."""
+    records = discover_runs(base_dir, allow_legacy=True)
+    records = [record for record in records if os.path.exists(record['returns_path'])]
+    return latest_records(records, key_fields=('condition_id', 'seed'))
 
 
-def load_run(run_dir):
-    """Load returns and metrics from a run directory."""
-    data = {}
-    returns_path = os.path.join(run_dir, 'returns.npy')
-    metrics_path = os.path.join(run_dir, 'metrics.json')
+def group_runs(runs):
+    """Group run records by condition id."""
+    grouped = {}
+    for (_, _), record in sorted(runs.items(), key=lambda item: item[1]['condition_label']):
+        group = grouped.setdefault(
+            record['condition_id'],
+            {'label': record['condition_label'], 'runs': []},
+        )
+        group['runs'].append(record)
+    return grouped
 
-    if os.path.exists(returns_path):
-        data['returns'] = np.load(returns_path)
-    if os.path.exists(metrics_path):
-        with open(metrics_path) as f:
-            data['metrics'] = json.load(f)
-    return data
+
+def _ordered_groups(grouped):
+    return sorted(grouped.values(), key=lambda item: item['label'])
+
+
+def _success_rate_from_returns(returns):
+    if len(returns) == 0:
+        return 0.0
+    return 100.0 * float(np.mean(np.array(returns) > 0.0))
 
 
 def plot_learning_curves(runs, output_path):
     """Plot learning curves for all conditions with mean±std across seeds."""
+    grouped = group_runs(runs)
     fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+    colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
 
-    conditions = {
-        'flat': ('Flat PPO (KeyCorridor)', '#1f77b4'),
-        'flat_corridor': ('Flat PPO (corridor)', '#aec7e8'),
-        'continuous': ('HRL Continuous (KeyCorridor)', '#ff7f0e'),
-        'continuous_corridor': ('HRL Continuous (corridor)', '#ffbb78'),
-        'discrete': ('HRL Discrete', '#2ca02c'),
-        'discrete_corridor': ('HRL Discrete (corridor)', '#9467bd'),
-        'social': ('HRL Social', '#d62728'),
-    }
-
-    for mode, (label, color) in conditions.items():
-        mode_runs = {k: v for k, v in runs.items() if k[0] == mode}
-        if not mode_runs:
-            continue
-
+    for idx, group in enumerate(_ordered_groups(grouped)):
         all_returns = []
-        for (m, seed), path in sorted(mode_runs.items()):
-            data = load_run(path)
-            if 'returns' in data:
-                smoothed = smooth(data['returns'], window=50)
-                all_returns.append(smoothed)
+        for record in sorted(group['runs'], key=lambda item: item['seed']):
+            data = load_run(record)
+            if 'returns' not in data:
+                continue
+            all_returns.append(smooth(data['returns'], window=50))
 
         if not all_returns:
             continue
 
-        min_len = min(len(r) for r in all_returns)
-        all_returns = np.array([r[:min_len] for r in all_returns])
-
-        mean = all_returns.mean(axis=0)
-        std = all_returns.std(axis=0)
-
+        min_len = min(len(returns) for returns in all_returns)
+        stacked = np.array([returns[:min_len] for returns in all_returns])
+        mean = stacked.mean(axis=0)
+        std = stacked.std(axis=0)
         episodes = np.arange(len(mean))
-        ax.plot(episodes, mean, label=label, color=color, linewidth=2)
+        color = colors[idx % len(colors)]
+
+        ax.plot(episodes, mean, label=group['label'], color=color, linewidth=2)
         ax.fill_between(episodes, mean - std, mean + std, alpha=0.2, color=color)
 
     ax.set_xlabel('Episode', fontsize=12)
     ax.set_ylabel('Return (smoothed, window=50)', fontsize=12)
-    ax.set_title('Learning Curves (mean ± std across 3 seeds)', fontsize=14)
-    ax.legend(fontsize=11)
+    ax.set_title('Learning Curves (mean ± std across available seeds)', fontsize=14)
+    ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -119,52 +106,43 @@ def plot_learning_curves(runs, output_path):
 
 def plot_success_rate(runs, output_path):
     """Plot success rate over time (binned into windows)."""
+    grouped = group_runs(runs)
     fig, ax = plt.subplots(1, 1, figsize=(10, 6))
-
-    conditions = {
-        'flat': ('Flat PPO (KeyCorridor)', '#1f77b4'),
-        'flat_corridor': ('Flat PPO (corridor)', '#aec7e8'),
-        'continuous': ('HRL Continuous (KeyCorridor)', '#ff7f0e'),
-        'continuous_corridor': ('HRL Continuous (corridor)', '#ffbb78'),
-        'discrete': ('HRL Discrete', '#2ca02c'),
-        'discrete_corridor': ('HRL Discrete (corridor)', '#9467bd'),
-        'social': ('HRL Social', '#d62728'),
-    }
-
+    colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
     n_bins = 20
 
-    for mode, (label, color) in conditions.items():
-        mode_runs = {k: v for k, v in runs.items() if k[0] == mode}
-        if not mode_runs:
-            continue
-
+    for idx, group in enumerate(_ordered_groups(grouped)):
         all_rates = []
-        for (m, seed), path in sorted(mode_runs.items()):
-            data = load_run(path)
+        for record in sorted(group['runs'], key=lambda item: item['seed']):
+            data = load_run(record)
             if 'returns' not in data:
                 continue
-            r = data['returns']
-            ws = len(r) // n_bins
-            if ws == 0:
+            returns = data['returns']
+            window_size = len(returns) // n_bins
+            if window_size == 0:
                 continue
-            rates = [100 * np.count_nonzero(r[i*ws:(i+1)*ws]) / ws for i in range(n_bins)]
+            rates = [
+                100.0 * float(np.mean(returns[i * window_size:(i + 1) * window_size] > 0.0))
+                for i in range(n_bins)
+            ]
             all_rates.append(rates)
 
         if not all_rates:
             continue
 
-        all_rates = np.array(all_rates)
-        mean = all_rates.mean(axis=0)
-        std = all_rates.std(axis=0)
-
+        stacked = np.array(all_rates)
+        mean = stacked.mean(axis=0)
+        std = stacked.std(axis=0)
         x = np.arange(n_bins)
-        ax.plot(x, mean, label=label, color=color, linewidth=2, marker='o', markersize=4)
+        color = colors[idx % len(colors)]
+
+        ax.plot(x, mean, label=group['label'], color=color, linewidth=2, marker='o', markersize=4)
         ax.fill_between(x, mean - std, mean + std, alpha=0.2, color=color)
 
     ax.set_xlabel('Training Progress (bins)', fontsize=12)
     ax.set_ylabel('Success Rate (%)', fontsize=12)
-    ax.set_title('Success Rate Over Training (mean ± std across 3 seeds)', fontsize=14)
-    ax.legend(fontsize=11)
+    ax.set_title('Success Rate Over Training (mean ± std across available seeds)', fontsize=14)
+    ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -175,39 +153,33 @@ def plot_success_rate(runs, output_path):
 
 def plot_goal_metrics(runs, output_path):
     """Plot goal quality metrics comparison as bar charts."""
-    conditions = {
-        'discrete': ('HRL Discrete', '#2ca02c'),
-        'discrete_corridor': ('HRL Discrete (corridor)', '#9467bd'),
-        'social': ('HRL Social', '#d62728'),
-    }
-
+    grouped = group_runs(runs)
     metric_names = ['entropy', 'coverage', 'temporal_extent']
     metric_labels = ['Goal Entropy', 'Goal Coverage', 'Temporal Extent']
+    fig, axes = plt.subplots(1, 3, figsize=(max(15, len(grouped) * 2.8), 5))
+    colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-
-    for metric_name, metric_label, ax in zip(metric_names, metric_labels, axes):
-        labels, means, stds, colors = [], [], [], []
-
-        for mode, (label, color) in conditions.items():
-            mode_runs = {k: v for k, v in runs.items() if k[0] == mode}
+    ordered = _ordered_groups(grouped)
+    for ax, metric_name, metric_label in zip(axes, metric_names, metric_labels):
+        labels, means, stds = [], [], []
+        for group in ordered:
             values = []
-            for (m, seed), path in sorted(mode_runs.items()):
-                data = load_run(path)
+            for record in group['runs']:
+                data = load_run(record)
                 if 'metrics' in data and metric_name in data['metrics']:
                     values.append(data['metrics'][metric_name])
-
             if values:
-                labels.append(label)
+                labels.append(group['label'])
                 means.append(np.mean(values))
                 stds.append(np.std(values))
-                colors.append(color)
 
         if labels:
-            ax.bar(labels, means, yerr=stds, capsize=5, color=colors, alpha=0.8)
+            x = np.arange(len(labels))
+            ax.bar(x, means, yerr=stds, capsize=5,
+                   color=[colors[i % len(colors)] for i in range(len(labels))], alpha=0.8)
+            ax.set_xticks(x, labels, rotation=20, ha='right')
             ax.set_title(metric_label, fontsize=12)
             ax.grid(True, alpha=0.3, axis='y')
-            ax.tick_params(axis='x', rotation=15)
 
     plt.suptitle('Goal Quality Metrics Comparison', fontsize=14, y=1.02)
     plt.tight_layout()
@@ -217,44 +189,38 @@ def plot_goal_metrics(runs, output_path):
 
 
 def plot_discrete_token_usage(runs, output_path):
-    """Plot per-position token usage for discrete/social modes."""
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    """Plot per-position token entropy for communication-heavy conditions."""
+    grouped = group_runs(runs)
+    ordered = _ordered_groups(grouped)
+    fig, axes = plt.subplots(1, 3, figsize=(max(15, len(grouped) * 2.5), 4))
+    colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
 
-    for mode, color, marker in [('discrete', '#2ca02c', 'o'), ('social', '#d62728', 's')]:
-        mode_runs = {k: v for k, v in runs.items() if k[0] == mode}
-        if not mode_runs:
-            continue
+    for pos, ax in enumerate(axes):
+        labels, means, stds = [], [], []
+        for group in ordered:
+            values = []
+            for record in group['runs']:
+                data = load_run(record)
+                if 'metrics' in data:
+                    key = f'position_{pos}_entropy'
+                    if key in data['metrics']:
+                        values.append(data['metrics'][key])
+            if values:
+                labels.append(group['label'])
+                means.append(np.mean(values))
+                stds.append(np.std(values))
 
-        for pos in range(3):
-            entropies = []
-            tokens_used = []
-            for (m, seed), path in sorted(mode_runs.items()):
-                data = load_run(path)
-                if 'metrics' not in data:
-                    continue
-                m_data = data['metrics']
-                key_e = f'position_{pos}_entropy'
-                key_t = f'position_{pos}_used_tokens'
-                if key_e in m_data:
-                    entropies.append(m_data[key_e])
-                if key_t in m_data:
-                    tokens_used.append(m_data[key_t])
+        if labels:
+            x = np.arange(len(labels))
+            ax.bar(x, means, yerr=stds, capsize=5,
+                   color=[colors[i % len(colors)] for i in range(len(labels))], alpha=0.8)
+            ax.set_xticks(x, labels, rotation=20, ha='right')
+            ax.set_title(f'Position {pos} Entropy', fontsize=12)
+            ax.set_ylabel('Entropy')
+            ax.axhline(y=np.log(10), color='gray', linestyle='--', alpha=0.5, label='Max (ln 10)')
+            ax.grid(True, alpha=0.3, axis='y')
 
-            if entropies:
-                ax = axes[pos]
-                x = range(len(entropies))
-                ax.bar([i + (0.35 if mode == 'social' else 0) for i in x],
-                       entropies, width=0.35, color=color, alpha=0.8,
-                       label=f'{mode.title()}')
-                ax.set_title(f'Position {pos} Entropy', fontsize=12)
-                ax.set_ylabel('Entropy (bits)')
-                ax.set_xlabel('Seed')
-                ax.axhline(y=np.log(10), color='gray', linestyle='--',
-                          alpha=0.5, label='Max (ln 10)')
-                ax.legend(fontsize=9)
-                ax.grid(True, alpha=0.3, axis='y')
-
-    plt.suptitle('Per-Position Token Entropy (K=10)', fontsize=14, y=1.02)
+    plt.suptitle('Per-Position Token Entropy', fontsize=14, y=1.02)
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     print(f"Saved token usage to {output_path}")
@@ -263,54 +229,55 @@ def plot_discrete_token_usage(runs, output_path):
 
 def generate_summary_table(runs, output_path):
     """Generate a markdown summary table."""
-    conditions = ['flat', 'continuous', 'discrete', 'discrete_corridor', 'social']
-    labels = {
-        'flat': 'Flat PPO (KeyCorridor)', 'flat_corridor': 'Flat PPO (corridor)', 'continuous': 'HRL Continuous (KeyCorridor)', 'continuous_corridor': 'HRL Continuous (corridor)',
-        'discrete': 'HRL Discrete', 'discrete_corridor': 'HRL Discrete (corridor)',
-        'social': 'HRL Social',
-    }
-
+    grouped = group_runs(runs)
     rows = []
-    for mode in conditions:
-        mode_runs = {k: v for k, v in runs.items() if k[0] == mode}
-        if not mode_runs:
-            continue
 
-        returns_list, entropies, coverages, success_rates = [], [], [], []
+    for group in _ordered_groups(grouped):
+        final_returns = []
+        success_rates = []
+        entropies = []
+        coverages = []
 
-        for (m, seed), path in sorted(mode_runs.items()):
-            data = load_run(path)
-            if 'returns' in data:
-                r = data['returns']
-                returns_list.append(r.mean())
-                success_rates.append(100 * np.count_nonzero(r) / len(r))
-            if 'metrics' in data:
-                m_data = data['metrics']
-                entropies.append(m_data.get('entropy', 0))
-                coverages.append(m_data.get('coverage', 0))
+        for record in sorted(group['runs'], key=lambda item: item['seed']):
+            data = load_run(record)
+            metrics = data.get('metrics', {})
+            if 'final_return_mean' in metrics:
+                final_returns.append(metrics['final_return_mean'])
+            elif 'returns' in data and len(data['returns']) > 0:
+                final_returns.append(float(np.mean(data['returns'][-100:])))
+
+            if 'eval_success_rate' in metrics:
+                success_rates.append(100.0 * metrics['eval_success_rate'])
+            elif 'returns' in data:
+                success_rates.append(_success_rate_from_returns(data['returns']))
+
+            if 'entropy' in metrics:
+                entropies.append(metrics['entropy'])
+            if 'coverage' in metrics:
+                coverages.append(metrics['coverage'])
 
         rows.append({
-            'condition': labels[mode],
-            'seeds': len(mode_runs),
-            'return_mean': np.mean(returns_list) if returns_list else 0,
-            'return_std': np.std(returns_list) if returns_list else 0,
-            'success_mean': np.mean(success_rates) if success_rates else 0,
-            'success_std': np.std(success_rates) if success_rates else 0,
-            'entropy_mean': np.mean(entropies) if entropies else 0,
-            'coverage_mean': np.mean(coverages) if coverages else 0,
+            'condition': group['label'],
+            'seeds': len(group['runs']),
+            'return_mean': np.mean(final_returns) if final_returns else 0.0,
+            'return_std': np.std(final_returns) if final_returns else 0.0,
+            'success_mean': np.mean(success_rates) if success_rates else 0.0,
+            'success_std': np.std(success_rates) if success_rates else 0.0,
+            'entropy_mean': np.mean(entropies) if entropies else 0.0,
+            'coverage_mean': np.mean(coverages) if coverages else 0.0,
         })
 
     with open(output_path, 'w') as f:
-        f.write("# Experiment 1 Results Summary\n\n")
-        f.write("| Condition | Seeds | Return (mean±std) | Success Rate | Goal Entropy | Coverage |\n")
-        f.write("|-----------|-------|-------------------|--------------|--------------|----------|\n")
-        for r in rows:
-            f.write(f"| {r['condition']} | {r['seeds']} | "
-                    f"{r['return_mean']:.4f}±{r['return_std']:.4f} | "
-                    f"{r['success_mean']:.1f}%±{r['success_std']:.1f}% | "
-                    f"{r['entropy_mean']:.3f} | "
-                    f"{r['coverage_mean']:.4f} |\n")
-        f.write("\n*3 seeds per condition, 1M steps each.*\n")
+        f.write("# Results Summary\n\n")
+        f.write("| Condition | Seeds | Final Return (mean±std) | Success Rate | Goal Entropy | Coverage |\n")
+        f.write("|-----------|-------|-------------------------|--------------|--------------|----------|\n")
+        for row in rows:
+            f.write(
+                f"| {row['condition']} | {row['seeds']} | "
+                f"{row['return_mean']:.4f}±{row['return_std']:.4f} | "
+                f"{row['success_mean']:.1f}%±{row['success_std']:.1f}% | "
+                f"{row['entropy_mean']:.3f} | {row['coverage_mean']:.4f} |\n"
+            )
 
     print(f"Saved summary to {output_path}")
 
@@ -318,15 +285,16 @@ def generate_summary_table(runs, output_path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--experiment-dir', type=str, default='outputs/')
+    parser.add_argument('--output-dir', type=str, default=None)
     args = parser.parse_args()
 
     runs = find_latest_runs(args.experiment_dir)
-    print(f"Found {len(runs)} runs:")
-    for (mode, seed), path in sorted(runs.items()):
-        print(f"  {mode} seed {seed}: {path}")
+    print(f"Found {len(runs)} latest runs:")
+    for (_, _), record in sorted(runs.items(), key=lambda item: item[1]['condition_label']):
+        print(f"  {record['condition_label']} seed {record['seed']}: {record['run_dir']}")
     print()
 
-    plots_dir = os.path.join(args.experiment_dir, 'plots')
+    plots_dir = args.output_dir or os.path.join(args.experiment_dir, 'plots')
     os.makedirs(plots_dir, exist_ok=True)
 
     plot_learning_curves(runs, os.path.join(plots_dir, 'learning_curves.png'))

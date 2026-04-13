@@ -1,0 +1,84 @@
+communication:
+  ablation_mode: true
+  listener_reward_coef: 0.0
+  message_length: 3
+  tau_anneal_steps: 200000
+  tau_end: 0.1
+  tau_start: 1.0
+  vocab_size: 10
+encoder:
+  channels:
+  - 16
+  - 32
+  - 64
+  hidden_dim: 128
+env:
+  asymmetric_info: false
+  corridor_size: 11
+  corridor_width: 3
+  effective_name: TwoAgentCorridor-S11-W3-v0
+  fully_observable: false
+  max_steps: 500
+  name: MiniGrid-KeyCorridorS3R2-v0
+  task_family: corridor_social
+  use_corridor: false
+experiment:
+  condition_id: mode-social__task-corridor-social__env-twoagentcorridor-s11-w3__size-11__width-3
+  condition_label: HRL Social (social corridor)
+  device: cuda
+  eval_episodes: 20
+  log_interval: 10
+  output_dir: outputs
+  run_slug: mode-social__task-corridor-social__env-twoagentcorridor-s11-w3__size-11__width-3__seed-42
+  save_interval: 100000
+  seed: 42
+  wandb_entity: null
+  wandb_project: social-hrl
+manager:
+  goal_dim: 16
+  goal_period: 10
+  hidden_dim: 128
+  option_critic:
+    num_options: 8
+    termination_reg: 0.01
+  use_option_critic: false
+multi_agent:
+  comm_reward_coef: 0.1
+  listener_reward_coef: 0.0
+  num_agents: 2
+  shared_critic: true
+ppo:
+  anneal_lr: true
+  clip_eps: 0.2
+  entropy_coef: 0.01
+  gae_lambda: 0.95
+  gamma: 0.99
+  lr: 0.0003
+  max_grad_norm: 0.5
+  num_envs: 8
+  num_minibatches: 4
+  num_steps: 128
+  total_timesteps: 1000000
+  update_epochs: 4
+  value_coef: 0.5
+sac:
+  alpha: 0.2
+  auto_alpha: true
+  batch_size: 256
+  buffer_size: 200000
+  enabled: false
+  lr: 0.0003
+  target_entropy: null
+  tau: 0.005
+  warmup_steps: 1000
+transfer:
+  freeze_comm: true
+  freeze_encoder: true
+  freeze_manager: true
+  freeze_worker: false
+worker:
+  extrinsic_reward_coef: 1.0
+  hidden_dim: 128
+  intrinsic_anneal: false
+  intrinsic_anneal_steps: 500000
+  intrinsic_reward_coef: 1.0

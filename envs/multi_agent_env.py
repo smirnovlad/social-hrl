@@ -6,6 +6,7 @@ and must navigate through shared narrow corridors, creating coordination pressur
 
 import gymnasium as gym
 import numpy as np
+from minigrid.core.constants import OBJECT_TO_IDX
 from minigrid.core.grid import Grid
 from minigrid.core.world_object import Goal, Wall, Door, Key
 from minigrid.core.mission import MissionSpace
@@ -16,18 +17,21 @@ class TwoAgentCorridorEnv(MiniGridEnv):
     """Custom two-agent Minigrid with a shared narrow corridor.
 
     Layout:
-        Room A (left) -- narrow corridor (1 cell wide) -- Room B (right)
+        Room A (left) -- corridor -- Room B (right)
         Agent A starts in Room A, needs to reach goal in Room B.
         Agent B starts in Room B, needs to reach goal in Room A.
-        The corridor is 1 cell wide, so agents block each other.
 
-    The environment runs two agents sequentially within each step.
-    Communication happens between steps.
+    Args:
+        corridor_width: Width of the corridor (1=narrow/blocking, 3=wide).
+        asymmetric_info: If True, agent 1 cannot see goal tiles.
     """
 
-    def __init__(self, size=11, corridor_length=3, max_steps=200, **kwargs):
+    def __init__(self, size=11, corridor_length=3, max_steps=200,
+                 corridor_width=3, asymmetric_info=False, **kwargs):
         self.corridor_length = corridor_length
         self._size = size
+        self.corridor_width = corridor_width
+        self.asymmetric_info = asymmetric_info
 
         mission_space = MissionSpace(mission_func=lambda: "navigate to goal")
 
@@ -56,9 +60,11 @@ class TwoAgentCorridorEnv(MiniGridEnv):
         corridor_start = width // 2 - self.corridor_length // 2
         corridor_end = corridor_start + self.corridor_length
 
+        half = self.corridor_width // 2
+
         # Create walls to form two rooms with a corridor
         for y in range(1, height - 1):
-            if y < mid_y - 1 or y > mid_y + 1:  # Corridor is 3 cells high
+            if y < mid_y - half or y > mid_y + half:
                 for x in [corridor_start, corridor_end - 1]:
                     if 1 <= x < width - 1:
                         self.grid.set(x, y, Wall())
@@ -98,7 +104,16 @@ class TwoAgentCorridorEnv(MiniGridEnv):
         self.agent_pos = old_pos
         self.agent_dir = old_dir
 
-        return obs['image']
+        image = obs['image']
+
+        # Asymmetric info: agent 1 cannot see goal tiles in the corridor task.
+        if self.asymmetric_info and agent_idx == 1:
+            mask = image[:, :, 0] == OBJECT_TO_IDX['goal']
+            image[mask, 0] = 1  # empty
+            image[mask, 1] = 0  # no color
+            image[mask, 2] = 0  # no state
+
+        return image
 
     def reset(self, **kwargs):
         obs, info = super().reset(**kwargs)
@@ -170,7 +185,7 @@ class TwoAgentCorridorEnv(MiniGridEnv):
         self.step_count += 1
 
         # Randomly decide who moves first to avoid bias
-        order = [0, 1] if np.random.random() > 0.5 else [1, 0]
+        order = [0, 1] if self.np_random.random() > 0.5 else [1, 0]
 
         # Capture pre-step done state for coordination bonus detection
         prev_both_done = all(self.agent_dones)
@@ -208,9 +223,10 @@ class SingleAgentCorridorEnv(gym.Wrapper):
     Returns gym-compatible (obs, reward, terminated, truncated, info).
     """
 
-    def __init__(self, size=11, corridor_length=3, max_steps=200):
+    def __init__(self, size=11, corridor_length=3, max_steps=200, corridor_width=3):
         env = TwoAgentCorridorEnv(
             size=size, corridor_length=corridor_length, max_steps=max_steps,
+            corridor_width=corridor_width,
         )
         super().__init__(env)
         self.observation_space = env.observation_space['image']
@@ -226,7 +242,8 @@ class SingleAgentCorridorEnv(gym.Wrapper):
         return obs_a, rew_a, agent_a_done, truncated, info
 
 
-def make_corridor_vec_env(num_envs, seed=0, max_steps=200, single_agent=True):
+def make_corridor_vec_env(num_envs, seed=0, max_steps=200, single_agent=True,
+                          corridor_width=3, corridor_size=11):
     """Create vectorized corridor environments.
 
     Args:
@@ -234,11 +251,13 @@ def make_corridor_vec_env(num_envs, seed=0, max_steps=200, single_agent=True):
         seed: Base seed.
         max_steps: Max steps per episode.
         single_agent: If True, single-agent version for discrete mode comparison.
+        corridor_width: Width of the corridor passage (1=narrow, 3=wide).
     """
     def _make(i):
         def _init():
             env = SingleAgentCorridorEnv(
-                size=11, corridor_length=3, max_steps=max_steps,
+                size=corridor_size, corridor_length=3, max_steps=max_steps,
+                corridor_width=corridor_width,
             )
             env.reset(seed=seed + i)
             return env
@@ -254,11 +273,14 @@ class MultiAgentWrapper:
     interface for the multi-agent trainer.
     """
 
-    def __init__(self, size=11, corridor_length=3, max_steps=200, seed=0):
+    def __init__(self, size=11, corridor_length=3, max_steps=200, seed=0,
+                 corridor_width=3, asymmetric_info=False):
         self.env = TwoAgentCorridorEnv(
             size=size,
             corridor_length=corridor_length,
             max_steps=max_steps,
+            corridor_width=corridor_width,
+            asymmetric_info=asymmetric_info,
         )
         self.observation_space = self.env.observation_space['image']
         self.action_space = self.env.action_space

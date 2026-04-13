@@ -67,7 +67,12 @@ def ppo_update(batch, policy_fn, optimizer, clip_eps=0.2, entropy_coef=0.01,
 
     advantages = batch['advantages']
     # Normalize advantages
-    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    adv_mean = advantages.mean()
+    adv_std = advantages.std(unbiased=False)
+    if torch.isfinite(adv_std) and adv_std > 1e-8:
+        advantages = (advantages - adv_mean) / (adv_std + 1e-8)
+    else:
+        advantages = advantages - adv_mean
 
     # Policy loss (clipped surrogate)
     log_ratio = new_log_probs - batch['old_log_probs']
