@@ -31,7 +31,7 @@ SCENARIOS = {
     'bus_strict':  {'bus': True,  'bus_window': 4,  'turn_taking': False},
     'turn_taking': {'bus': False, 'bus_window': 0,  'turn_taking': True},
 }
-MODES = ['discrete', 'social']
+MODES = os.environ.get('MODES', 'discrete social').split()
 SEEDS = [int(s) for s in os.environ.get('SEEDS', '42').split()]
 TIMESTEPS = int(os.environ.get('TIMESTEPS', '12000'))
 ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
