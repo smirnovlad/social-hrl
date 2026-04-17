@@ -109,6 +109,16 @@ def build_condition_label(metadata):
         variants.append(f"listener={listener_reward:g}")
     if metadata.get("asymmetric_info"):
         variants.append("asymmetric")
+    if metadata.get("vocab_size", 10) != 10:
+        variants.append(f"K={metadata['vocab_size']}")
+    if metadata.get("message_length", 3) != 3:
+        variants.append(f"L={metadata['message_length']}")
+    if metadata.get("rendezvous_bonus", 0.0) > 0:
+        variants.append(f"rendezvous={metadata['rendezvous_bonus']:g}")
+    if metadata.get("num_obstacles", 0) > 0:
+        variants.append(f"obstacles={metadata['num_obstacles']}")
+    if metadata.get("eval_comm_ablation"):
+        variants.append("comm-ablation")
 
     if variants:
         label += f" [{', '.join(variants)}]"
@@ -127,6 +137,11 @@ def build_run_metadata(
     asymmetric_info=False,
     use_sac=False,
     use_option_critic=False,
+    vocab_size=10,
+    message_length=3,
+    rendezvous_bonus=0.0,
+    num_obstacles=0,
+    eval_comm_ablation=False,
 ):
     """Create the metadata dict shared by train/plot/transfer scripts."""
     mode = canonical_mode(mode, use_sac=use_sac, use_option_critic=use_option_critic)
@@ -154,6 +169,16 @@ def build_run_metadata(
         condition_parts.append(f"listener-{format_number_token(listener_reward_coef)}")
     if asymmetric_info:
         condition_parts.append("asymmetric")
+    if vocab_size != 10:
+        condition_parts.append(f"vocab-{vocab_size}")
+    if message_length != 3:
+        condition_parts.append(f"msglen-{message_length}")
+    if rendezvous_bonus > 0:
+        condition_parts.append(f"rendezvous-{format_number_token(rendezvous_bonus)}")
+    if num_obstacles > 0:
+        condition_parts.append(f"obstacles-{num_obstacles}")
+    if eval_comm_ablation:
+        condition_parts.append("comm-ablation")
 
     condition_id = "__".join(condition_parts)
     metadata = {
@@ -170,6 +195,11 @@ def build_run_metadata(
         "asymmetric_info": bool(asymmetric_info),
         "use_sac": bool(mode == "sac_continuous"),
         "use_option_critic": bool(mode == "option_critic"),
+        "vocab_size": int(vocab_size),
+        "message_length": int(message_length),
+        "rendezvous_bonus": float(rendezvous_bonus),
+        "num_obstacles": int(num_obstacles),
+        "eval_comm_ablation": bool(eval_comm_ablation),
         "condition_id": condition_id,
     }
     metadata["condition_label"] = build_condition_label(metadata)

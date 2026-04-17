@@ -1,11 +1,13 @@
 # Environment
 env:
   name: "MiniGrid-KeyCorridorS3R2-v0"  # Start simpler, scale up
-  max_steps: 500
+  max_steps: 200
   fully_observable: false  # partial observability (7x7 agent view)
   corridor_size: 11        # grid size for corridor-based tasks
   corridor_width: 3        # 1 for narrow (blocking/coordination), 3 for wide
   asymmetric_info: false   # in corridor social mode, agent 1 cannot see goal tiles
+  rendezvous_bonus: 0.0    # bonus when both agents are in corridor simultaneously
+  num_obstacles: 0         # random wall obstacles placed in rooms
 
 # Architecture
 encoder:
@@ -23,10 +25,11 @@ manager:
 
 worker:
   hidden_dim: 128
-  intrinsic_reward_coef: 1.0
+  intrinsic_reward_coef: 0.1
   extrinsic_reward_coef: 1.0
   intrinsic_anneal: false         # anneal intrinsic_reward_coef from initial to 0
   intrinsic_anneal_steps: 500000  # steps over which to anneal
+  intrinsic_warmup_steps: 200000  # linearly ramp intrinsic from 0 to target
 
 communication:
   vocab_size: 10  # K

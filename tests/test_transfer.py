@@ -75,9 +75,15 @@ class TransferDiscoveryTests(unittest.TestCase):
             self.assertEqual(len(skipped), 1)
             self.assertIn("below_threshold", skipped[0]["reason"])
 
-    def test_validate_transfer_request_blocks_social_sources(self):
+    def test_validate_transfer_request_accepts_social_sources(self):
+        # Should not raise — social transfer is supported
+        validate_transfer_request("social")
+
+    def test_validate_transfer_request_rejects_unknown_modes(self):
         with self.assertRaises(ValueError):
-            validate_transfer_request("social")
+            validate_transfer_request("continuous")
+        with self.assertRaises(ValueError):
+            validate_transfer_request("flat")
 
 
 if __name__ == "__main__":

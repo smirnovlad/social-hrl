@@ -15,6 +15,9 @@ from collections import defaultdict
 
 import numpy as np
 import torch
+# Match train.py: single BLAS thread per process. Transfer can also be
+# launched alongside other jobs.
+torch.set_num_threads(1)
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -28,6 +31,20 @@ from models.encoder import MinigridEncoder
 from models.manager import Manager
 from models.worker import Worker
 from transfer_utils import discover_source_runs, validate_transfer_request
+
+
+def _extract_agent_state_dict(module_list_sd, agent_idx=0):
+    """Extract a single agent's state dict from a ModuleList state dict.
+
+    ModuleList state dicts have keys like '0.conv.0.weight', '1.conv.0.weight'.
+    This filters to agent_idx and strips the prefix.
+    """
+    prefix = f"{agent_idx}."
+    return {
+        k[len(prefix):]: v
+        for k, v in module_list_sd.items()
+        if k.startswith(prefix)
+    }
 
 
 class TransferTrainer:
@@ -76,25 +93,53 @@ class TransferTrainer:
         self.num_steps = num_steps
         self.total_timesteps = total_timesteps
 
-        self.encoder = MinigridEncoder(
-            obs_shape, channels=tuple(config['encoder']['channels']),
-            hidden_dim=hidden_dim
-        ).to(self.device)
-        self.encoder.load_state_dict(state['encoder'])
-
-        self.manager = Manager(
-            input_dim=hidden_dim, goal_dim=goal_dim,
-            hidden_dim=config['manager']['hidden_dim'],
-        ).to(self.device)
-        self.manager.load_state_dict(state['manager'])
-
+        self._social_source = (source_mode == 'social') or state.get('mode') == 'social'
+        self._goal_dim = goal_dim
         comm_cfg = config['communication']
-        self.comm_channel = CommunicationChannel(
-            goal_dim=goal_dim, vocab_size=comm_cfg['vocab_size'],
-            message_length=comm_cfg['message_length'],
-            tau=comm_cfg['tau_end'],
-        ).to(self.device)
-        self.comm_channel.load_state_dict(state['comm_channel'])
+
+        if self._social_source:
+            encoder_sd = _extract_agent_state_dict(state['encoders'], agent_idx=0)
+            manager_sd = _extract_agent_state_dict(state['managers'], agent_idx=0)
+            comm_sd = _extract_agent_state_dict(state['comm_channels'], agent_idx=0)
+
+            self.encoder = MinigridEncoder(
+                obs_shape, channels=tuple(config['encoder']['channels']),
+                hidden_dim=hidden_dim
+            ).to(self.device)
+            self.encoder.load_state_dict(encoder_sd)
+
+            self.manager = Manager(
+                input_dim=hidden_dim, goal_dim=goal_dim,
+                hidden_dim=config['manager']['hidden_dim'],
+                message_dim=goal_dim,
+            ).to(self.device)
+            self.manager.load_state_dict(manager_sd)
+
+            self.comm_channel = CommunicationChannel(
+                goal_dim=goal_dim, vocab_size=comm_cfg['vocab_size'],
+                message_length=comm_cfg['message_length'],
+                tau=comm_cfg['tau_end'],
+            ).to(self.device)
+            self.comm_channel.load_state_dict(comm_sd)
+        else:
+            self.encoder = MinigridEncoder(
+                obs_shape, channels=tuple(config['encoder']['channels']),
+                hidden_dim=hidden_dim
+            ).to(self.device)
+            self.encoder.load_state_dict(state['encoder'])
+
+            self.manager = Manager(
+                input_dim=hidden_dim, goal_dim=goal_dim,
+                hidden_dim=config['manager']['hidden_dim'],
+            ).to(self.device)
+            self.manager.load_state_dict(state['manager'])
+
+            self.comm_channel = CommunicationChannel(
+                goal_dim=goal_dim, vocab_size=comm_cfg['vocab_size'],
+                message_length=comm_cfg['message_length'],
+                tau=comm_cfg['tau_end'],
+            ).to(self.device)
+            self.comm_channel.load_state_dict(state['comm_channel'])
 
         if freeze_encoder:
             for p in self.encoder.parameters():
@@ -148,8 +193,14 @@ class TransferTrainer:
         return -torch.norm(projected - goal_norm, dim=-1)
 
     def _select_goal(self, features):
-        h = self.manager.policy(features)
-        goal_mean = self.manager.goal_mean(h)
+        if self._social_source:
+            zero_msg = torch.zeros(
+                features.shape[0], self._goal_dim, device=features.device
+            )
+            _, _, _, goal_mean = self.manager(features, received_message=zero_msg)
+        else:
+            h = self.manager.policy(features)
+            goal_mean = self.manager.goal_mean(h)
         msg_onehot, _, _ = self.comm_channel.encode(goal_mean)
         return self.comm_channel.decode(msg_onehot)
 

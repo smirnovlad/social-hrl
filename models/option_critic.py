@@ -47,12 +47,18 @@ class OptionCriticManager(nn.Module):
         # Each option maps to a goal vector
         self.option_goals = nn.Embedding(num_options, goal_dim)
 
-        # Termination function: per-option probability of terminating
+        # Termination function: per-option probability of terminating.
+        # Bias the final layer so initial beta ≈ sigmoid(-3) ≈ 0.047, giving
+        # options an expected lifetime of ~20 steps at init. Without this the
+        # initial beta ≈ 0.5 causes options to churn every ~2 steps and the
+        # worker can never learn a stable goal-conditioned policy.
         self.termination_head = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, num_options),
         )
+        with torch.no_grad():
+            self.termination_head[-1].bias.fill_(-3.0)
 
         # Value function for policy-over-options
         self.value_head = nn.Sequential(
@@ -163,24 +169,53 @@ class OptionCriticManager(nn.Module):
 
         return log_prob, entropy, value
 
-    def termination_loss(self, features, current_option, advantages, beta):
+    def beta_for(self, features, current_option):
+        """Differentiable termination probability for the current option.
+
+        Args:
+            features: (batch, input_dim).
+            current_option: (batch,).
+        Returns:
+            beta: (batch,) termination probability (with gradient).
+        """
+        term_logits = self.termination_head(features)
+        return torch.sigmoid(
+            term_logits.gather(1, current_option.unsqueeze(-1)).squeeze(-1)
+        )
+
+    def q_for(self, features, current_option, received_message=None):
+        """Q(s, omega) for the option taken.
+
+        Args:
+            features: (batch, input_dim).
+            current_option: (batch,).
+            received_message: (batch, message_dim) or None.
+        Returns:
+            q: (batch,) Q-value of the current option (with gradient).
+        """
+        if received_message is not None:
+            x = torch.cat([features, received_message], dim=-1)
+        else:
+            x = features
+        q_values = self.q_head(x)
+        return q_values.gather(1, current_option.unsqueeze(-1)).squeeze(-1)
+
+    def termination_loss(self, features, current_option, advantages):
         """Compute termination gradient loss.
 
         Following Bacon et al. 2017:
-        L_term = beta * (advantage + reg)
-
-        Encourages termination when switching to a better option (positive advantage)
-        and penalizes premature termination via termination_reg.
+            dL/d_theta_beta ∝ beta(s, omega) * (A(s, omega) + xi)
+        where xi = termination_reg pushes beta toward 0 (stickiness). The
+        gradient flows through the differentiable beta; advantages are
+        treated as a constant baseline.
 
         Args:
             features: (batch, input_dim).
             current_option: (batch,).
             advantages: (batch,) Q(s, omega) - V(s).
-            beta: (batch,) termination probabilities.
         Returns:
             loss: Scalar.
         """
-        # Advantage-based termination: terminate when current option is worse than average
-        # Plus regularization to prevent always-terminate
+        beta = self.beta_for(features, current_option)
         loss = (beta * (advantages.detach() + self.termination_reg)).mean()
         return loss

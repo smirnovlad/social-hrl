@@ -5,10 +5,10 @@ from experiment_utils import discover_runs
 
 def validate_transfer_request(source_mode):
     """Validate source/target compatibility for the current transfer implementation."""
-    if source_mode == 'social':
+    if source_mode not in ('discrete', 'social'):
         raise ValueError(
-            "Social-to-single-agent transfer is intentionally unsupported in this pipeline. "
-            "Use discrete sources or implement a matched social target first."
+            f"Unsupported source mode '{source_mode}' for transfer. "
+            "Supported: 'discrete', 'social'."
         )
 
 

@@ -21,6 +21,7 @@ from models.worker import Worker
 from models.communication import CommunicationChannel
 from algos.ppo import compute_gae, ppo_update
 from algos.td3 import ManagerTD3
+from analysis.goal_metrics import temporal_extent as _temporal_extent
 from envs.wrappers import make_env, make_vec_env
 
 
@@ -239,24 +240,33 @@ class HRLTrainer:
         self.intrinsic_coef = config['worker']['intrinsic_reward_coef']
         self.extrinsic_coef = config['worker']['extrinsic_reward_coef']
 
-        # Intrinsic reward annealing
+        # Intrinsic reward annealing and warmup
         self.intrinsic_anneal = config['worker'].get('intrinsic_anneal', False)
         self.intrinsic_anneal_steps = config['worker'].get('intrinsic_anneal_steps', 500000)
+        self.intrinsic_warmup_steps = config['worker'].get('intrinsic_warmup_steps', 0)
 
         # Logging
         self.global_step = 0
         self.log = defaultdict(list)
 
-        # Persistent obs across rollouts
+        # Persistent obs and episode reward accumulators across rollouts
         obs, _ = self.envs.reset()
         self.obs = torch.from_numpy(obs).to(self.device)
+        self._episode_rewards = np.zeros(self.num_envs)
 
     def _get_intrinsic_coef(self):
-        """Get current intrinsic reward coefficient (with optional annealing)."""
-        if not self.intrinsic_anneal:
-            return self.intrinsic_coef
-        frac = min(1.0, self.global_step / self.intrinsic_anneal_steps)
-        return self.intrinsic_coef * (1.0 - frac)
+        """Get current intrinsic reward coefficient (with warmup then optional anneal)."""
+        target = self.intrinsic_coef
+        # Warmup: linearly ramp from 0 to target
+        if self.intrinsic_warmup_steps > 0 and self.global_step < self.intrinsic_warmup_steps:
+            target = target * (self.global_step / self.intrinsic_warmup_steps)
+        # Anneal: decay from target to 0 (after warmup)
+        if self.intrinsic_anneal:
+            anneal_start = self.intrinsic_warmup_steps
+            elapsed = max(0, self.global_step - anneal_start)
+            frac = min(1.0, elapsed / self.intrinsic_anneal_steps)
+            target = target * (1.0 - frac)
+        return target
 
     def _anneal_tau(self):
         """Anneal Gumbel-Softmax temperature (discrete/option_critic mode only)."""
@@ -286,7 +296,6 @@ class HRLTrainer:
         val_buf = torch.zeros(self.num_steps, self.num_envs).to(self.device)
 
         obs = self.obs
-        episode_rewards = np.zeros(self.num_envs)
         episode_returns = []
 
         for step in range(self.num_steps):
@@ -302,11 +311,11 @@ class HRLTrainer:
             rew_buf[step] = torch.from_numpy(reward).float().to(self.device)
             done_buf[step] = torch.from_numpy(done).float().to(self.device)
 
-            episode_rewards += reward
+            self._episode_rewards += reward
             for i, d in enumerate(done):
                 if d:
-                    episode_returns.append(episode_rewards[i])
-                    episode_rewards[i] = 0
+                    episode_returns.append(self._episode_rewards[i])
+                    self._episode_rewards[i] = 0
 
             obs = torch.from_numpy(next_obs).to(self.device)
             self.global_step += self.num_envs
@@ -364,6 +373,7 @@ class HRLTrainer:
         # Manager buffers — per-environment
         m_feat_buf = [[] for _ in range(N)]
         m_goal_buf = [[] for _ in range(N)]
+        m_goal_mean_buf = [[] for _ in range(N)]  # For comm channel training
         m_rew_buf = [[] for _ in range(N)]
         m_done_buf = [[] for _ in range(N)]
         # PPO-specific (discrete/option_critic only)
@@ -387,7 +397,6 @@ class HRLTrainer:
         if self.use_option_critic:
             current_option = torch.zeros(N, dtype=torch.long).to(self.device)
 
-        episode_rewards = np.zeros(N)
         episode_returns = []
 
         for step in range(T):
@@ -414,7 +423,7 @@ class HRLTrainer:
                         option, log_prob, value, goal = self.option_critic(features)
                         self._anneal_tau()
                         msg_onehot, msg_indices, _ = self.comm_channel.encode(goal)
-                        decoded_goal = self.comm_channel.decode(msg_onehot)
+                        decoded_goal = F.normalize(self.comm_channel.decode(msg_onehot), dim=-1)
 
                     new_option = torch.where(needs_new_goal, option, current_option)
                     new_goal = torch.where(
@@ -467,11 +476,12 @@ class HRLTrainer:
 
                 elif self.mode == 'discrete':
                     with torch.no_grad():
-                        goal, log_prob, value, _ = self.manager(features)
+                        goal, log_prob, value, goal_mean = self.manager(features)
                     self._anneal_tau()
                     with torch.no_grad():
-                        msg_onehot, msg_indices, _ = self.comm_channel.encode(goal)
-                        decoded_goal = self.comm_channel.decode(msg_onehot)
+                        # Use goal_mean for comm channel (consistent with eval)
+                        msg_onehot, msg_indices, _ = self.comm_channel.encode(goal_mean)
+                        decoded_goal = F.normalize(self.comm_channel.decode(msg_onehot), dim=-1)
                     new_goal = torch.where(
                         needs_new_goal.unsqueeze(-1).expand_as(decoded_goal),
                         decoded_goal, current_goal
@@ -484,6 +494,7 @@ class HRLTrainer:
                         if needs_new_goal[i]:
                             m_feat_buf[i].append(features[i])
                             m_goal_buf[i].append(goal[i])
+                            m_goal_mean_buf[i].append(goal_mean[i])
                             m_logp_buf[i].append(log_prob[i])
                             m_val_buf[i].append(value[i])
                             m_rew_buf[i].append(manager_extrinsic_reward[i].clone())
@@ -522,11 +533,11 @@ class HRLTrainer:
             # Accumulate extrinsic reward for manager
             manager_extrinsic_reward += reward_t
 
-            episode_rewards += reward
+            self._episode_rewards += reward
             for i, d in enumerate(done):
                 if d:
-                    episode_returns.append(episode_rewards[i])
-                    episode_rewards[i] = 0
+                    episode_returns.append(self._episode_rewards[i])
+                    self._episode_rewards[i] = 0
                     steps_since_goal[i] = 0
                     if self.use_option_critic:
                         if m_done_buf[i]:
@@ -562,6 +573,7 @@ class HRLTrainer:
         if self.mode == 'continuous' and not self.use_option_critic:
             # Feed transitions to TD3/SAC replay buffer
             manager_obj = self.manager_sac if self.use_sac else self.manager_td3
+            all_cont_goals = []
             for i in range(N):
                 n_events = len(m_feat_buf[i])
                 if n_events < 2:
@@ -574,6 +586,9 @@ class HRLTrainer:
                         next_state=m_feat_buf[i][j + 1].unsqueeze(0),
                         done=torch.tensor([m_done_buf[i][j]]),
                     )
+                all_cont_goals.append(torch.stack(m_goal_buf[i]))
+            if all_cont_goals:
+                manager_data = {'goals': torch.cat(all_cont_goals)}
 
         elif self.mode == 'discrete' or self.use_option_critic:
             # Build PPO data for manager
@@ -600,6 +615,13 @@ class HRLTrainer:
                 if self.use_option_critic:
                     all_m_options.append(torch.stack(m_option_buf[i][:-1]))
 
+            # Collect goal_means for comm channel training
+            all_m_goal_means = []
+            if self.mode == 'discrete':
+                for i in range(N):
+                    if len(m_goal_mean_buf[i]) >= 2:
+                        all_m_goal_means.append(torch.stack(m_goal_mean_buf[i][:-1]))
+
             if all_m_advantages:
                 manager_data = {
                     'features': torch.cat(all_m_features),
@@ -608,8 +630,20 @@ class HRLTrainer:
                     'advantages': torch.cat(all_m_advantages),
                     'returns': torch.cat(all_m_returns),
                 }
+                if all_m_goal_means:
+                    manager_data['goal_means'] = torch.cat(all_m_goal_means)
                 if self.use_option_critic and all_m_options:
                     manager_data['options'] = torch.cat(all_m_options)
+
+        # Compute temporal_extent correctly: the per-env per-step goal sequence
+        # (w_goal_buf[:, i, :]) is the object whose persistence we care about.
+        # Flattening messages across envs makes consecutive entries cross-env,
+        # not temporal, which reports extent ~= 1 regardless of behavior.
+        goal_seq = w_goal_buf.detach().cpu().numpy()  # (T, N, D)
+        per_env_extents = [
+            float(_temporal_extent(goal_seq[:, i, :], threshold=0.01))
+            for i in range(N)
+        ]
 
         return {
             'worker': {
@@ -623,6 +657,7 @@ class HRLTrainer:
             'manager': manager_data,
             'messages': messages_log,
             'states': states_log,
+            'per_env_temporal_extents': per_env_extents,
         }, episode_returns
 
     # ------------------------------------------------------------------
@@ -698,11 +733,47 @@ class HRLTrainer:
                             for k, v in stats.items():
                                 all_stats[f'manager_{k}'].append(v)
 
-            # Communication channel reconstruction loss
-            if m_data and m_data.get('goals') is not None:
-                raw_goals = m_data['goals'].detach()
+            # Option-Critic: also train Q-head (TD) and termination head.
+            # The PPO update above only touches policy_over_options and
+            # value_head; q_head and termination_head are untouched, so we
+            # need a separate gradient step or termination never learns and
+            # options churn at init bias sigmoid(-3) ≈ 0.05 forever.
+            if self.use_option_critic and m_data and m_data.get('options') is not None:
+                feats = m_data['features']
+                opts = m_data['options']
+                returns = m_data['returns'].detach()
+                advantages = m_data['advantages'].detach()
+
+                q_pred = self.option_critic.q_for(feats, opts)
+                q_loss = F.mse_loss(q_pred, returns)
+                term_loss = self.option_critic.termination_loss(
+                    feats, opts, advantages
+                )
+                oc_loss = q_loss + term_loss
+
+                self.manager_optimizer.zero_grad()
+                oc_loss.backward()
+                nn.utils.clip_grad_norm_(
+                    self.option_critic.parameters(), self.max_grad_norm
+                )
+                self.manager_optimizer.step()
+
+                with torch.no_grad():
+                    mean_beta = self.option_critic.beta_for(feats, opts).mean().item()
+                all_stats['oc_q_loss'].append(q_loss.item())
+                all_stats['oc_term_loss'].append(term_loss.item())
+                all_stats['oc_mean_beta'].append(mean_beta)
+
+            # Communication channel reconstruction loss.
+            # Normalize goals to the unit sphere before passing through the
+            # bottleneck: otherwise recon_loss + sender_entropy has a trivial
+            # minimum at raw_goals -> 0 (encoder logits uniform, decoder outputs
+            # zeros), causing silent magnitude collapse in goal space.
+            comm_goals = m_data.get('goal_means', m_data.get('goals'))
+            if m_data and comm_goals is not None:
+                raw_goals = F.normalize(comm_goals.detach(), dim=-1)
                 msg_onehot, _, logits = self.comm_channel.encode(raw_goals)
-                reconstructed = self.comm_channel.decode(msg_onehot)
+                reconstructed = F.normalize(self.comm_channel.decode(msg_onehot), dim=-1)
                 recon_loss = F.mse_loss(reconstructed, raw_goals)
 
                 # Sender entropy bonus to encourage diverse messages
@@ -747,10 +818,9 @@ class HRLTrainer:
         return logits.argmax(dim=-1)
 
     def _select_discrete_goal(self, features):
-        h = self.manager.policy(features)
-        goal_mean = self.manager.goal_mean(h)
-        msg_onehot, _, _ = self.comm_channel.encode(goal_mean)
-        return self.comm_channel.decode(msg_onehot)
+        _, _, _, goal_mean = self.manager(features)
+        msg_onehot, _ = self.comm_channel.encode_deterministic(goal_mean)
+        return F.normalize(self.comm_channel.decode(msg_onehot), dim=-1)
 
     def _select_option_goal(self, features, current_option=None, steps_since_goal=0):
         if current_option is None:
@@ -766,8 +836,8 @@ class HRLTrainer:
                 current_option = option_logits.argmax(dim=-1)
 
         goal = self.option_critic.option_goals(current_option)
-        msg_onehot, _, _ = self.comm_channel.encode(goal)
-        return current_option, self.comm_channel.decode(msg_onehot)
+        msg_onehot, _ = self.comm_channel.encode_deterministic(goal)
+        return current_option, F.normalize(self.comm_channel.decode(msg_onehot), dim=-1)
 
     def evaluate(self, num_episodes=20):
         """Evaluate the current policy on the training task."""
@@ -838,6 +908,10 @@ class HRLTrainer:
         all_returns = []
         all_messages = []
         all_states = []
+        all_decoded_goals = []
+        all_temporal_extents = []
+        recent_recon_loss = []
+        recent_mean_beta = []
 
         mode_name = 'option_critic' if self.use_option_critic else self.mode
         if self.use_sac:
@@ -875,6 +949,20 @@ class HRLTrainer:
                     all_messages.extend(rollout['messages'])
                 if rollout.get('states') and rollout['states']:
                     all_states.extend(rollout['states'])
+                # For collapse analysis: retain the realized (post-bottleneck)
+                # goals that the worker actually conditioned on during the
+                # rollout. This is the object whose collapse matters.
+                m_data = rollout.get('manager') or {}
+                if isinstance(m_data, dict) and 'goals' in m_data:
+                    g = m_data['goals'].detach().cpu().numpy()
+                    if g.ndim == 2 and len(g) > 0:
+                        all_decoded_goals.append(g)
+                if 'comm_recon_loss' in stats:
+                    recent_recon_loss.append(stats['comm_recon_loss'])
+                if 'oc_mean_beta' in stats:
+                    recent_mean_beta.append(stats['oc_mean_beta'])
+                if rollout.get('per_env_temporal_extents'):
+                    all_temporal_extents.extend(rollout['per_env_temporal_extents'])
 
             all_returns.extend(ep_returns)
 
@@ -916,10 +1004,18 @@ class HRLTrainer:
             f"{final_eval['std_return']:.3f} | success={100 * final_eval['success_rate']:.1f}%"
         )
 
+        decoded_goals_arr = (
+            np.concatenate(all_decoded_goals, axis=0)
+            if all_decoded_goals else None
+        )
         return {
             'returns': all_returns,
             'messages': all_messages,
             'states': all_states,
+            'decoded_goals': decoded_goals_arr,
+            'recon_loss_mean': float(np.mean(recent_recon_loss[-50:])) if recent_recon_loss else None,
+            'mean_beta': float(np.mean(recent_mean_beta[-50:])) if recent_mean_beta else None,
+            'temporal_extent_mean': float(np.mean(all_temporal_extents)) if all_temporal_extents else None,
             'eval': final_eval,
         }
 

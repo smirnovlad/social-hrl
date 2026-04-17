@@ -307,8 +307,51 @@ def listener_accuracy_probe(messages, states, vocab_size=10, message_length=3,
             return 0.0
 
 
+def goal_space_coverage(goals, n_bins_per_dim=4, max_dims=4):
+    """Coverage of decoded goal vectors in R^d, not message space.
+
+    Bins each of the first `max_dims` goal dimensions into `n_bins_per_dim`
+    quantile bins, then reports the fraction of the resulting joint cells that
+    see at least one sample. This is the right "goal collapse" signal: two
+    different messages that decode to nearly identical goals count as one cell,
+    so collapse is visible even when message entropy looks healthy.
+
+    Args:
+        goals: numpy array of shape (N, D) of decoded continuous goals.
+        n_bins_per_dim: Bins per dimension (quantile-based to avoid outliers).
+        max_dims: Cap on dimensions used to avoid 4^16 cells for goal_dim=16.
+    Returns:
+        coverage: Fraction of occupied joint cells in [0, 1].
+    """
+    goals = np.asarray(goals)
+    if goals.ndim != 2 or len(goals) < 2:
+        return 0.0
+    d = min(max_dims, goals.shape[1])
+    cells = np.zeros(len(goals), dtype=np.int64)
+    for dim in range(d):
+        col = goals[:, dim]
+        qs = np.linspace(0, 1, n_bins_per_dim + 1)
+        edges = np.quantile(col, qs)
+        edges[0] -= 1e-6
+        edges[-1] += 1e-6
+        idx = np.digitize(col, edges) - 1
+        idx = np.clip(idx, 0, n_bins_per_dim - 1)
+        cells = cells * n_bins_per_dim + idx
+    occupied = len(np.unique(cells))
+    total = n_bins_per_dim ** d
+    return float(occupied) / float(total)
+
+
+def goal_vector_std(goals):
+    """Mean per-dimension standard deviation. Collapse -> small std."""
+    goals = np.asarray(goals)
+    if goals.ndim != 2 or len(goals) < 2:
+        return 0.0
+    return float(goals.std(axis=0).mean())
+
+
 def compute_all_metrics(messages=None, continuous_goals=None, vocab_size=10,
-                        message_length=3, states=None):
+                        message_length=3, states=None, decoded_goals=None):
     """Compute all available goal quality metrics.
 
     Args:
@@ -317,6 +360,9 @@ def compute_all_metrics(messages=None, continuous_goals=None, vocab_size=10,
         vocab_size: K (for discrete mode).
         message_length: L (for discrete mode).
         states: List of encoder feature vectors corresponding to each message.
+        decoded_goals: numpy array (N, D) of decoded goals after message bottleneck.
+            When provided, goal_space_coverage / goal_vector_std are reported;
+            these measure collapse in *goal* space rather than *message* space.
     Returns:
         Dict of all metrics.
     """
@@ -354,5 +400,12 @@ def compute_all_metrics(messages=None, continuous_goals=None, vocab_size=10,
         metrics['coverage'] = len(counts) / total
         metrics['temporal_extent'] = temporal_extent(continuous_goals)
         metrics['goal_std'] = continuous_goals.std(axis=0).mean()
+        metrics['goal_space_coverage'] = goal_space_coverage(continuous_goals)
+
+    if decoded_goals is not None:
+        decoded_goals = np.asarray(decoded_goals)
+        if decoded_goals.ndim == 2 and len(decoded_goals) >= 2:
+            metrics['goal_space_coverage'] = goal_space_coverage(decoded_goals)
+            metrics['goal_vector_std'] = goal_vector_std(decoded_goals)
 
     return metrics

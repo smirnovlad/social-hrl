@@ -32,6 +32,11 @@ import json
 from datetime import datetime
 import numpy as np
 import torch
+# Pin intra-op BLAS threads. These networks are tiny (128-d MLPs) so
+# intra-op parallelism is pure overhead, and when the suite runs 4
+# parallel jobs without this, each torch process fights the others for
+# all cores.
+torch.set_num_threads(1)
 try:
     import wandb
 except ImportError:
@@ -76,7 +81,12 @@ def main():
     parser.add_argument('--corridor-width', type=int, default=None,
                         help='Corridor width (1=narrow blocking, 3=default)')
     parser.add_argument('--asymmetric-info', action='store_true',
-                        help='In social corridor mode, mask goal tiles from agent 1')
+                        help='In social corridor mode, mask goal tiles from agent 1. '
+                             'NOTE: social+corridor defaults to True (to give the '
+                             'communication channel an actual reason to exist). '
+                             'Use --no-asymmetric-info to opt out.')
+    parser.add_argument('--no-asymmetric-info', action='store_true',
+                        help='Force asymmetric_info off (overrides the social-mode default).')
     parser.add_argument('--intrinsic-anneal', action='store_true',
                         help='Anneal intrinsic reward coefficient to 0')
     parser.add_argument('--intrinsic-anneal-steps', type=int, default=None,
@@ -89,6 +99,14 @@ def main():
                         help='Deprecated alias for --eval-comm-ablation')
     parser.add_argument('--use-sac', action='store_true',
                         help='Use SAC instead of TD3 for continuous manager')
+    parser.add_argument('--vocab-size', type=int, default=None,
+                        help='Override communication vocab size K')
+    parser.add_argument('--message-length', type=int, default=None,
+                        help='Override communication message length L')
+    parser.add_argument('--rendezvous-bonus', type=float, default=None,
+                        help='Reward bonus when both agents occupy corridor simultaneously')
+    parser.add_argument('--num-obstacles', type=int, default=None,
+                        help='Number of random wall obstacles in corridor env rooms')
 
     args = parser.parse_args()
 
@@ -112,8 +130,17 @@ def main():
     # Apply new feature overrides
     if args.corridor_width is not None:
         config['env']['corridor_width'] = args.corridor_width
-    if args.asymmetric_info:
+    # Social + corridor without asymmetric info leaves the comm channel with
+    # no informational role: both agents see the goal, so messages are pure
+    # noise. Default to asymmetric unless the user explicitly opts out.
+    if args.no_asymmetric_info:
+        config['env']['asymmetric_info'] = False
+    elif args.asymmetric_info:
         config['env']['asymmetric_info'] = True
+    elif args.mode == 'social' and args.corridor:
+        config['env']['asymmetric_info'] = True
+        print("[info] social+corridor: defaulting asymmetric_info=True "
+              "(use --no-asymmetric-info to disable).")
     if args.intrinsic_anneal:
         config['worker']['intrinsic_anneal'] = True
     if args.intrinsic_anneal_steps is not None:
@@ -121,12 +148,28 @@ def main():
     if args.listener_reward is not None:
         config.setdefault('multi_agent', {})['listener_reward_coef'] = args.listener_reward
         config.setdefault('communication', {})['listener_reward_coef'] = args.listener_reward
+        if args.listener_reward > 0:
+            print(
+                "[warn] listener_reward > 0: this rewards movement toward a "
+                "partner's stated goal direction. Gains in entropy / "
+                "compositionality under this flag CANNOT be attributed to "
+                "'social pressure regularizes HRL' alone -- they are a "
+                "coordination-skill bonus. Report separately."
+            )
     if eval_comm_ablation:
         config.setdefault('communication', {})['ablation_mode'] = True
     if args.mode == 'option_critic':
         config['manager']['use_option_critic'] = True
     if args.use_sac or args.mode == 'sac_continuous':
         config.setdefault('sac', {})['enabled'] = True
+    if args.vocab_size is not None:
+        config['communication']['vocab_size'] = args.vocab_size
+    if args.message_length is not None:
+        config['communication']['message_length'] = args.message_length
+    if args.rendezvous_bonus is not None:
+        config['env']['rendezvous_bonus'] = args.rendezvous_bonus
+    if args.num_obstacles is not None:
+        config['env']['num_obstacles'] = args.num_obstacles
 
     now = datetime.now()
     run_metadata = build_run_metadata(
@@ -141,6 +184,11 @@ def main():
         asymmetric_info=config['env'].get('asymmetric_info', False),
         use_sac=config.get('sac', {}).get('enabled', False) or args.mode == 'sac_continuous',
         use_option_critic=args.mode == 'option_critic',
+        vocab_size=config['communication']['vocab_size'],
+        message_length=config['communication']['message_length'],
+        rendezvous_bonus=config['env'].get('rendezvous_bonus', 0.0),
+        num_obstacles=config['env'].get('num_obstacles', 0),
+        eval_comm_ablation=eval_comm_ablation,
     )
 
     config['env']['effective_name'] = run_metadata['env_name']
@@ -246,31 +294,35 @@ def main():
 
     # Compute and save metrics
     metrics = {}
+    all_msgs = []
     if results.get('messages'):
-        all_msgs = []
         for batch in results['messages']:
             if isinstance(batch, np.ndarray):
                 for msg in batch:
                     all_msgs.append(msg)
 
-        # Collect states for new metrics
-        all_states = []
-        if results.get('states'):
-            for batch in results['states']:
-                if isinstance(batch, np.ndarray):
-                    for s in batch:
-                        all_states.append(s)
+    all_states = []
+    if results.get('states'):
+        for batch in results['states']:
+            if isinstance(batch, np.ndarray):
+                for s in batch:
+                    all_states.append(s)
 
-        metrics = compute_all_metrics(
-            messages=all_msgs,
-            vocab_size=config['communication']['vocab_size'],
-            message_length=config['communication']['message_length'],
-            states=all_states if all_states else None,
-        )
+    metrics = compute_all_metrics(
+        messages=all_msgs if all_msgs else None,
+        vocab_size=config['communication']['vocab_size'],
+        message_length=config['communication']['message_length'],
+        states=all_states if all_states else None,
+        decoded_goals=results.get('decoded_goals'),
+    )
 
     metrics['final_return_mean'] = np.mean(results['returns'][-100:]) if results['returns'] else 0
     metrics['final_return_std'] = np.std(results['returns'][-100:]) if results['returns'] else 0
     metrics['total_episodes'] = len(results['returns'])
+    if results.get('recon_loss_mean') is not None:
+        metrics['comm_recon_loss'] = results['recon_loss_mean']
+    if results.get('mean_beta') is not None:
+        metrics['oc_mean_beta'] = results['mean_beta']
     if results.get('eval'):
         metrics['eval_mean_return'] = results['eval']['mean_return']
         metrics['eval_std_return'] = results['eval']['std_return']
