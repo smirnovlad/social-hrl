@@ -67,19 +67,25 @@ prevents goal collapse") is not.
 
 ### RQ2: Does social training transfer to better solo goal policies?
 
-**Verdict: directionally YES, magnitude small, single-seed.** Frozen-manager
-transfer from the bus-stress source config to a wider-corridor target:
+**Verdict: NO — multi-seed flips the single-seed claim.** Frozen-manager
+transfer from the bus-stress source config (size 9, width 1) to the wider
+corridor (size 11, width 3), aggregated over the same 3 seeds (42, 7, 123)
+used for RQ1:
 
 | source | eval return | eval success |
 |---|---|---|
-| discrete | −0.800 | 0.0% |
-| social | −0.750 | 0.0% |
+| discrete | **−0.750 ± 0.000** | 0.0% |
+| social | −0.783 ± 0.024 | 0.0% |
 
-Social transfers **+0.050** better on eval return. Neither source produces
-a success-rate signal at this budget; the gap is on within-episode shaping.
-This number is single-seed and within the per-seed coverage noise we see
-on RQ1, so it should be treated as directional only until a multi-seed
-transfer harness is run.
+Social transfers **−0.033 worse** on eval return (combined noise 0.024,
+NOTABLE). Neither source produces a success-rate signal at this budget,
+so the gap is on within-episode shaping rather than task completion. The
+prior single-seed +0.050 social advantage was seed-42 noise — the same
+pattern we saw with LOLA's coverage win, where one favorable draw flipped
+direction once seeds 7 and 123 were added.
+
+Reproduce: `python scripts/transfer_multiseed.py` (reuses
+`outputs/mini_sweep/seed-{42,7,123}` checkpoints, takes ~10 min on CPU).
 
 ### RQ3: Vocabulary / compositionality relationship
 
@@ -122,34 +128,53 @@ margin.
 
 ### RQ4: Which multi-agent scenarios provide strongest regularization?
 
-**Tested (seed 42, 10k timesteps):** baseline (no coordination), shared
-bus (cost-when-solo), strict bus (arrival-window), turn-taking.
+**Tested (3 seeds, 12k timesteps):** baseline (no coordination), shared
+bus (cost-when-solo), strict bus (arrival-window=4), turn-taking. Discrete
+is unaffected by these multi-agent flags and stays at coverage 0.999 in
+every row (the correct invariance).
 
 | scenario | social coverage | gap (social − discrete) | comm_ablation_delta | listener_accuracy |
 |---|---|---|---|---|
-| baseline | 0.414 | −0.578 | +0.131 | 0.057 |
-| bus | 0.496 | −0.496 | +0.069 | 0.039 |
-| bus_strict | 0.492 | −0.500 | −0.007 | 0.023 |
-| **turn_taking** | **0.559** | **−0.434** | +0.030 | 0.000 |
+| baseline | 0.486 ± 0.03 | −0.513 | +0.009 ± 0.01 | 0.068 ± 0.04 |
+| bus | 0.529 ± 0.03 | **−0.470** | +0.027 ± 0.08 | 0.058 ± 0.03 |
+| bus_strict | 0.529 ± 0.03 | **−0.470** | −0.001 ± 0.04 | 0.053 ± 0.04 |
+| turn_taking | 0.514 ± 0.03 | −0.484 | −0.004 ± 0.02 | 0.070 ± 0.02 |
 
-(discrete is unaffected by these multi-agent-only flags and stays at
-coverage 0.992 in every row — that is the correct invariance.)
+**Revised finding (vs. prior single-seed):** turn-taking is **no longer
+the strongest regularizer** once we average over seeds. The bus and
+bus_strict variants tie with the smallest gap (−0.470), turn-taking is
+slightly behind (−0.484), and baseline is the worst (−0.513). The prior
+single-seed +0.144 lift for turn-taking shrinks to **+0.029** and is
+within combined noise (~0.04 per side).
 
-**Key finding:** turn-taking narrows the social-vs-discrete coverage gap
-the most (−0.434 vs baseline −0.578, i.e. **+0.144 lift** from sequential
-coordination). The bus variants also lift over baseline (+0.08 each), but
-less than turn-taking.
+The honest 3-seed reading: shared-bus pressure does help slightly over
+baseline (+0.04 lift), but the spread across all four scenarios is small
+relative to the seed-to-seed noise. **No scenario closes the social-vs-
+discrete gap by more than ~10% of its baseline magnitude.**
 
-**But turn-taking's channel is effectively silent** (listener_accuracy =
-0.000, ablation_delta = +0.030). The scenario that best regularizes goal
-space is not the one whose channel carries the most information — in fact
-the opposite: baseline (no coordination) has the highest ablation_delta
-(+0.131) and turn-taking/bus_strict the lowest.
+`comm_ablation_delta` is positive only for baseline (+0.009) and bus
+(+0.027), and at most ~0.5σ from zero — the channel does not carry
+load-bearing information in any scenario. `listener_accuracy` stays in
+the 0.05–0.07 band across all scenarios (chance-level for K=10).
 
-Interpretation: turn-taking structures goal diversity by forcing the agent
-distribution itself, not by making the comm channel load-bearing. This is a
-meaningful RQ4 signal and a new finding relative to the single-seed
-single-scenario story in the prior revision.
+#### LOLA × scenario cross (3 seeds, 12k timesteps)
+
+We also ran the LOLA opponent-aware learner under the same four scenarios
+to check the second positive single-seed signal (turn-taking + LOLA):
+
+| scenario | LOLA coverage | LOLA return | comm_ablation_delta |
+|---|---|---|---|
+| baseline | 0.353 ± 0.12 | −0.709 ± 0.06 | +0.013 |
+| **bus** | **0.435 ± 0.08** | −0.846 ± 0.00 | −0.098 |
+| bus_strict | 0.435 ± 0.08 | −0.850 ± 0.01 | −0.069 |
+| turn_taking | 0.384 ± 0.15 | −0.803 ± 0.01 | +0.004 |
+
+Bus pressure lifts LOLA's coverage most (+0.082 over baseline), but its
+return drops the furthest (−0.137). Turn-taking does not pair with LOLA
+to produce a coverage win — LOLA + turn-taking sits between baseline and
+bus on coverage and below baseline on return. **No LOLA × scenario
+combination beats social on coverage** (LOLA bus 0.435 vs social bus
+0.529), so the cross does not rescue either method.
 
 ## LOLA and MADDPG — multi-seed head-to-head (bus + stress, 15k steps)
 
@@ -179,18 +204,20 @@ necessary.
   collapse on the standard coverage metric. The finding is now 3-seed
   stable: discrete = 0.996 ± 0.006, social = 0.474 ± 0.037, LOLA = 0.495
   ± 0.144. LOLA's previous single-seed win (0.621) is not reproducible.
-- **RQ2**: weakly yes, single-seed. Social transfers +0.050 eval return
-  over discrete; needs multi-seed validation.
+- **RQ2**: NO. Multi-seed transfer flips the single-seed story: social
+  is **−0.033 worse** than discrete on eval return (−0.783 ± 0.024 vs
+  −0.750 ± 0.000, NOTABLE). The +0.050 social win was seed-42 noise.
 - **RQ3**: the story is split. Coverage says discrete wins at every K × L.
   Compositionality (topographic similarity) is small but favors social by
   ~3σ (−0.008 ± 0.007 vs +0.015 ± 0.008). If "goal quality" means coverage,
   the bottleneck does all the work. If it means compositionality, social
   contributes a real (small) signal on top.
-- **RQ4**: turn-taking is the strongest coverage-regularizer of the
-  scenarios tested (+0.144 lift over baseline), larger than bus (+0.08) or
-  strict bus (+0.08). This regularization does not come from the comm
-  channel carrying more information — listener accuracy drops to zero
-  under turn-taking.
+- **RQ4**: small effects, all within noise once seeds are averaged.
+  Bus and bus_strict tie for smallest social-vs-discrete coverage gap
+  (−0.470, +0.04 lift over baseline); turn-taking's prior single-seed
+  +0.144 lift shrinks to +0.029. LOLA × turn-taking does not rescue
+  either method. No scenario's `comm_ablation_delta` is reliably above
+  zero — channel never carries load-bearing information.
 
 ## Reproducibility
 
@@ -207,49 +234,61 @@ python scripts/vocab_sweep.py --timesteps 10000 --seed 42 --bus
 python scripts/rq4_scenarios.py                  # 1 seed, fast
 SEEDS="42 7 123" python scripts/rq4_scenarios.py # 3 seeds, slower
 
-# Single-seed transfer (RQ2):
-python scripts/verify_hypotheses.py --modes discrete social --stress --bus \
-    --timesteps 15000 --seed 42 --output-dir outputs/bus_verify
-python scripts/transfer_verify.py \
-    --discrete-ckpt outputs/bus_verify/<ts>/discrete/final.pt \
-    --social-ckpt   outputs/bus_verify/<ts>/social/final.pt \
-    --target-size 11 --target-width 3 --timesteps 30000
+# Multi-seed transfer (RQ2):
+python scripts/transfer_multiseed.py            # 3 seeds, ~10 min CPU
+
+# LOLA x scenario cross (RQ4):
+MODES=lola SEEDS="42 7 123" python scripts/rq4_scenarios.py
 ```
 
 Outputs land in `outputs/mini_sweep/`, `outputs/vocab_sweep/`,
-`outputs/rq4_scenarios/`. Each directory contains an
-`aggregated_summary.json` with means, stds, and per-seed values.
+`outputs/rq4_scenarios/`, and `outputs/transfer_multiseed/`. Each
+directory contains an `aggregated_summary.json` with means, stds, and
+per-seed values.
 
 ## What would change the answer
 
-Given RQ1 is robustly negative, the remaining paths are:
+With RQ1, RQ2, and RQ4 all robustly negative or within-noise across 3
+seeds — and the only positive signal being a small compositionality lift
+(RQ3) — the remaining paths are:
 
 1. **Compositional target envs** (BabyAI mission-string tasks) where the
    goal distribution is genuinely compositional, not just spatially diverse.
    Needs [envs/wrappers.py](envs/wrappers.py) to stop discarding mission
    strings and an encoder that consumes them. The current topsim numbers
    are near zero in absolute terms — this is likely a ceiling of the
-   corridor task, not a method limitation.
+   corridor task, not a method limitation. **This is the highest-leverage
+   next step**, since the only surviving social-favorable signal is
+   compositionality and the corridor cannot stretch it further.
 2. **A harder manager-worker asymmetry** — e.g. manager trained from sparse
    extrinsic reward only, not intrinsic shaping — so goal-space diversity
    actually bottlenecks return.
-3. **Turn-taking as the primary scenario** rather than bus. RQ4 shows it
-   regularizes more; pairing it with LOLA or a cleaner compositional env
-   is the natural next step.
+3. **Larger-budget transfer (50–100k timesteps)** to see whether the
+   multi-seed RQ2 result remains negative when the target task has time
+   to actually solve. At the current 20k budget no source produces any
+   success-rate signal.
 
 LOLA-style opponent-aware learning on the communication-channel update is
 implemented at [algos/lola_trainer.py](algos/lola_trainer.py). In the
-multi-seed regime reported above it is not a significant improvement over
-MAPPO, contrary to the single-seed claim in the prior revision of this
-document.
+multi-seed regime reported above (both standalone RQ1 and crossed with
+all four scenarios) it is not a significant improvement over MAPPO,
+contrary to the single-seed claim in the prior revision of this document.
 
 ## Revision history
 
-- **This revision** (post-audit): 3-seed aggregation replaces single-seed
-  headline numbers; topographic_similarity (compositionality) is now
-  reported; bus_strict and turn_taking scenarios added for RQ4; LOLA's
-  single-seed win shown to be within noise; prior self-contradiction
-  about LOLA implementation status fixed.
-- **Prior revision**: single-seed (seed 42) numbers only; claimed LOLA
-  closed 30% of the coverage gap; did not report compositionality; RQ4
+- **This revision** (multi-seed follow-up, 2026-04-18): RQ2 transfer is
+  now 3-seed via [scripts/transfer_multiseed.py](scripts/transfer_multiseed.py)
+  and **flips direction** (social −0.033 worse, NOTABLE); RQ4 scenario
+  comparison is now 3-seed and the single-seed turn-taking advantage
+  collapses (+0.144 → +0.029, within noise); LOLA × scenario cross added
+  via `MODES=lola` in [scripts/rq4_scenarios.py](scripts/rq4_scenarios.py)
+  and shows no scenario rescues LOLA over social.
+- **Previous revision** (post-audit): 3-seed aggregation replaced single-seed
+  RQ1/RQ3 numbers; topographic_similarity (compositionality) surfaced;
+  bus_strict and turn_taking scenarios added for RQ4; LOLA's single-seed
+  coverage win shown to be within noise; prior self-contradiction about
+  LOLA implementation status fixed.
+- **Original revision**: single-seed (seed 42) numbers only; claimed LOLA
+  closed 30% of the coverage gap; claimed +0.050 social transfer win;
+  claimed turn-taking +0.144 lift; did not report compositionality; RQ4
   only tested shared-bus.
