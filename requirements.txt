@@ -9,3 +9,4 @@ scikit-learn>=1.2
 pytest>=7.0
 wandb>=0.17
 python-dotenv>=1.0
+pandas>=2.0
