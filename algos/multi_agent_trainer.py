@@ -758,6 +758,8 @@ class MultiAgentTrainer:
                         'episodes': len(all_returns),
                         'intrinsic_coef': self._get_intrinsic_coef(),
                     }
+                    if hasattr(self, 'comm_channels') and self.comm_channels:
+                        log_data['gumbel_tau'] = float(self.comm_channels[0].tau.item())
                     log_data.update(stats)
                     wandb_run.log(log_data, step=self.global_step)
 

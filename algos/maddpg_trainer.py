@@ -299,6 +299,8 @@ class MaddpgTrainer:
         noise_std_init = 1.0
         noise_std_end = 0.1
 
+        log_interval = max(self.total_timesteps // 50, 200)
+        last_stats = {}
         t0 = time.time()
         while self.global_step < self.total_timesteps:
             frac = min(1.0, self.global_step / max(1, self.total_timesteps))
@@ -324,7 +326,23 @@ class MaddpgTrainer:
 
             self.global_step += 1
             if self.global_step % self.update_every == 0:
-                self._update_once()
+                stats = self._update_once() or {}
+                if stats:
+                    last_stats = stats
+
+            if wandb_run is not None and self.global_step % log_interval == 0:
+                mean_ret = float(np.mean(returns[-50:])) if returns else 0.0
+                sps = self.global_step / max(1e-6, time.time() - t0)
+                log_data = {
+                    'global_step': self.global_step,
+                    'mean_return': mean_ret,
+                    'sps': sps,
+                    'noise_std': noise_std,
+                    'replay_buffer_size': len(self.buffer),
+                    'episodes': len(returns),
+                }
+                log_data.update(last_stats)
+                wandb_run.log(log_data, step=self.global_step)
 
         eval_result = self.evaluate(num_episodes=self.eval_episodes)
         dt = time.time() - t0

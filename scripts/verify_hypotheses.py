@@ -191,7 +191,10 @@ def build_config(total_timesteps, corridor_size, mode, seed, corridor_width=3,
         'experiment': {
             'seed': seed,
             'device': 'cpu',
-            'log_interval': 50,
+            # log_interval is measured in PPO updates (not timesteps). With
+            # num_envs=4, num_steps=64 -> 256 timesteps per update. Default
+            # to ~30 log points across the whole run regardless of budget.
+            'log_interval': max(1, (total_timesteps // (num_envs * num_steps)) // 30),
             'save_interval': 10_000_000,
             'eval_episodes': 10,
             'wandb_project': None,
