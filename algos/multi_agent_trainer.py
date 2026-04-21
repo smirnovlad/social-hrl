@@ -3,6 +3,11 @@
 Each agent has its own encoder, manager, worker, and communication channel.
 Agent A's message is embedded and fed to Agent B's manager (and vice versa).
 A shared centralized critic sees both agents' features for variance reduction.
+
+Features:
+- Listener reward: reward agent for partner following its message
+- Communication ablation: zero out messages at eval time
+- Intrinsic reward annealing
 """
 
 import os
@@ -18,6 +23,7 @@ from models.manager import Manager
 from models.worker import Worker
 from models.communication import CommunicationChannel
 from algos.ppo import compute_gae, ppo_update
+from analysis.goal_metrics import temporal_extent as _temporal_extent
 from envs.multi_agent_env import MultiAgentWrapper
 
 
@@ -49,6 +55,16 @@ class MultiAgentTrainer:
         env_cfg = config['env']
         ppo_cfg = config['ppo']
         comm_cfg = config['communication']
+        self.max_steps = env_cfg.get('max_steps', 200)
+        self.corridor_size = env_cfg.get('corridor_size', 11)
+        self.corridor_width = env_cfg.get('corridor_width', 3)
+        self.rendezvous_bonus = env_cfg.get('rendezvous_bonus', 0.0)
+        self.num_obstacles = env_cfg.get('num_obstacles', 0)
+        self.bus_cost_solo = env_cfg.get('bus_cost_solo', 0.0)
+        self.bus_cost_shared = env_cfg.get('bus_cost_shared', 0.0)
+        self.bus_window = env_cfg.get('bus_window', 0)
+        self.turn_taking = env_cfg.get('turn_taking', False)
+        self.eval_episodes = config['experiment'].get('eval_episodes', 20)
         hidden_dim = config['encoder']['hidden_dim']
         goal_dim = config['manager']['goal_dim']
         message_dim = goal_dim  # embed_message outputs goal_dim
@@ -57,9 +73,17 @@ class MultiAgentTrainer:
         self.num_envs = ppo_cfg['num_envs']
         self.envs = [
             MultiAgentWrapper(
-                size=11, corridor_length=3,
-                max_steps=env_cfg.get('max_steps', 200),
+                size=self.corridor_size, corridor_length=3,
+                max_steps=self.max_steps,
                 seed=config['experiment']['seed'] + i,
+                corridor_width=self.corridor_width,
+                asymmetric_info=env_cfg.get('asymmetric_info', False),
+                rendezvous_bonus=self.rendezvous_bonus,
+                num_obstacles=self.num_obstacles,
+                bus_cost_solo=self.bus_cost_solo,
+                bus_cost_shared=self.bus_cost_shared,
+                bus_window=self.bus_window,
+                turn_taking=self.turn_taking,
             )
             for i in range(self.num_envs)
         ]
@@ -133,6 +157,20 @@ class MultiAgentTrainer:
         self.extrinsic_coef = config['worker']['extrinsic_reward_coef']
         self.comm_reward_coef = config['multi_agent']['comm_reward_coef']
 
+        # Intrinsic reward annealing and warmup
+        self.intrinsic_anneal = config['worker'].get('intrinsic_anneal', False)
+        self.intrinsic_anneal_steps = config['worker'].get('intrinsic_anneal_steps', 500000)
+        self.intrinsic_warmup_steps = config['worker'].get('intrinsic_warmup_steps', 0)
+
+        # Listener reward
+        self.listener_reward_coef = config.get('communication', {}).get('listener_reward_coef', 0.0)
+        ma_listener = config.get('multi_agent', {}).get('listener_reward_coef', 0.0)
+        if ma_listener > 0:
+            self.listener_reward_coef = ma_listener
+
+        # Communication ablation
+        self.comm_ablation = config.get('communication', {}).get('ablation_mode', False)
+
         self.tau_start = comm_cfg['tau_start']
         self.tau_end = comm_cfg['tau_end']
         self.tau_anneal_steps = comm_cfg['tau_anneal_steps']
@@ -157,6 +195,23 @@ class MultiAgentTrainer:
             torch.zeros(self.num_envs, msg_dim).to(self.device),
         ]
 
+        # Persistent episode reward accumulators across rollouts
+        self._episode_rewards = [np.zeros(self.num_envs), np.zeros(self.num_envs)]
+
+    def _get_intrinsic_coef(self):
+        """Get current intrinsic reward coefficient (with warmup then optional anneal)."""
+        target = self.intrinsic_coef
+        # Warmup: linearly ramp from 0 to target
+        if self.intrinsic_warmup_steps > 0 and self.global_step < self.intrinsic_warmup_steps:
+            target = target * (self.global_step / self.intrinsic_warmup_steps)
+        # Anneal: decay from target to 0 (after warmup)
+        if self.intrinsic_anneal:
+            anneal_start = self.intrinsic_warmup_steps
+            elapsed = max(0, self.global_step - anneal_start)
+            frac = min(1.0, elapsed / self.intrinsic_anneal_steps)
+            target = target * (1.0 - frac)
+        return target
+
     def _anneal_tau(self):
         frac = min(1.0, self.global_step / self.tau_anneal_steps)
         tau = self.tau_start + frac * (self.tau_end - self.tau_start)
@@ -168,7 +223,12 @@ class MultiAgentTrainer:
         goal_norm = F.normalize(goal, dim=-1)
         return -torch.norm(projected - goal_norm, dim=-1)
 
-    def collect_rollout(self):
+    def collect_rollout(self, ablate_comm=False):
+        """Collect a rollout from all environments.
+
+        Args:
+            ablate_comm: If True, zero out partner messages (for ablation testing).
+        """
         T = self.num_steps
         N = self.num_envs
 
@@ -195,6 +255,7 @@ class MultiAgentTrainer:
         m_msg_buf = [[[] for _ in range(N)] for _ in range(2)]  # partner msg embeddings
 
         messages_log = [[], []]
+        states_log = [[], []]
 
         current_goal = [
             torch.zeros(N, self.config['manager']['goal_dim']).to(self.device),
@@ -206,7 +267,6 @@ class MultiAgentTrainer:
         ]
         steps_since_goal = torch.zeros(N, dtype=torch.long).to(self.device)
 
-        episode_rewards = [np.zeros(N), np.zeros(N)]
         episode_returns = []
 
         for step in range(T):
@@ -227,14 +287,21 @@ class MultiAgentTrainer:
                     partner = 1 - a
                     # Embed partner's previous message
                     with torch.no_grad():
-                        partner_embed = self.comm_channels[partner].embed_message(
-                            self.partner_msg[partner]
-                        )
+                        if ablate_comm:
+                            partner_embed = torch.zeros(
+                                N, self.config['manager']['goal_dim']
+                            ).to(self.device)
+                        else:
+                            partner_embed = self.comm_channels[partner].embed_message(
+                                self.partner_msg[partner]
+                            )
                         goal, log_prob, value, _ = self.managers[a](
                             features[a], received_message=partner_embed
                         )
                         msg_onehot, msg_indices, _ = self.comm_channels[a].encode(goal)
-                        decoded_goal = self.comm_channels[a].decode(msg_onehot)
+                        decoded_goal = F.normalize(
+                            self.comm_channels[a].decode(msg_onehot), dim=-1
+                        )
 
                     new_goal = torch.where(
                         needs_new_goal.unsqueeze(-1).expand_as(decoded_goal),
@@ -248,6 +315,7 @@ class MultiAgentTrainer:
                     )
 
                     messages_log[a].append(msg_indices[needs_new_goal].cpu().numpy())
+                    states_log[a].append(features[a][needs_new_goal].detach().cpu().numpy())
 
                     # Manager PPO data
                     # Use shared critic for value
@@ -311,25 +379,41 @@ class MultiAgentTrainer:
             done_t = torch.from_numpy(dones.astype(np.float32)).to(self.device)
 
             # Worker rewards
+            intrinsic_coef = self._get_intrinsic_coef()
             for a in range(2):
                 reward_t = torch.from_numpy(rewards[a].astype(np.float32)).to(self.device)
                 with torch.no_grad():
                     next_feat = self.encoders[a](next_obs_t[a])
                     intrinsic = self._compute_intrinsic_reward(a, next_feat, current_goal[a])
-                worker_reward = self.intrinsic_coef * intrinsic + self.extrinsic_coef * reward_t
+                worker_reward = intrinsic_coef * intrinsic + self.extrinsic_coef * reward_t
                 bufs[a]['rewards'][step] = worker_reward
                 bufs[a]['dones'][step] = done_t
                 manager_ext_reward[a] += reward_t
 
+            # Listener reward: reward agent A proportional to how well
+            # agent B's state matches A's message (and vice versa)
+            if self.listener_reward_coef > 0 and not ablate_comm:
+                with torch.no_grad():
+                    for a in range(2):
+                        partner = 1 - a
+                        # How close is the partner's achieved state to our goal direction?
+                        partner_feat = self.encoders[partner](next_obs_t[partner])
+                        partner_proj = F.normalize(
+                            self.goal_projections[partner](partner_feat), dim=-1
+                        )
+                        our_goal_norm = F.normalize(current_goal[a], dim=-1)
+                        listener_sim = (partner_proj * our_goal_norm).sum(dim=-1)
+                        bufs[a]['rewards'][step] += self.listener_reward_coef * listener_sim
+
             # Episode tracking
             for env_idx in range(N):
-                episode_rewards[0][env_idx] += rewards[0][env_idx]
-                episode_rewards[1][env_idx] += rewards[1][env_idx]
+                self._episode_rewards[0][env_idx] += rewards[0][env_idx]
+                self._episode_rewards[1][env_idx] += rewards[1][env_idx]
                 if dones[env_idx]:
-                    total = episode_rewards[0][env_idx] + episode_rewards[1][env_idx]
+                    total = self._episode_rewards[0][env_idx] + self._episode_rewards[1][env_idx]
                     episode_returns.append(total / 2)  # average of both agents
-                    episode_rewards[0][env_idx] = 0
-                    episode_rewards[1][env_idx] = 0
+                    self._episode_rewards[0][env_idx] = 0
+                    self._episode_rewards[1][env_idx] = 0
                     steps_since_goal[env_idx] = 0
                     for a in range(2):
                         if m_done_buf[a][env_idx]:
@@ -391,7 +475,19 @@ class MultiAgentTrainer:
                     'returns': torch.cat(all_ret),
                 }
 
-        return worker_rollouts, manager_rollouts, messages_log, episode_returns
+        # Compute temporal_extent correctly per env (across both agents).
+        # bufs[a]['goals'] has shape (T, N, D); per-env sequences are what we
+        # actually want to measure for goal persistence.
+        per_env_extents = []
+        for a in range(2):
+            goal_seq = bufs[a]['goals'].detach().cpu().numpy()  # (T, N, D)
+            for i in range(N):
+                per_env_extents.append(
+                    float(_temporal_extent(goal_seq[:, i, :], threshold=0.01))
+                )
+
+        return (worker_rollouts, manager_rollouts, messages_log, states_log,
+                episode_returns, per_env_extents)
 
     def update(self, worker_rollouts, manager_rollouts):
         all_stats = defaultdict(list)
@@ -453,14 +549,19 @@ class MultiAgentTrainer:
                     for k, v in stats.items():
                         all_stats[f'manager_{k}'].append(v)
 
-        # Communication channel reconstruction loss (both agents)
+        # Communication channel reconstruction loss (both agents).
+        # Normalize goals to the unit sphere before passing through the
+        # bottleneck: otherwise recon_loss + sender_entropy has a trivial
+        # minimum at raw_goals -> 0 (silent magnitude collapse).
         for a in range(2):
             m_data = manager_rollouts[a]
             if not m_data or 'goals' not in m_data:
                 continue
-            raw_goals = m_data['goals'].detach()
+            raw_goals = F.normalize(m_data['goals'].detach(), dim=-1)
             msg_onehot, _, logits = self.comm_channels[a].encode(raw_goals)
-            reconstructed = self.comm_channels[a].decode(msg_onehot)
+            reconstructed = F.normalize(
+                self.comm_channels[a].decode(msg_onehot), dim=-1
+            )
             recon_loss = F.mse_loss(reconstructed, raw_goals)
 
             probs = F.softmax(logits, dim=-1)
@@ -477,6 +578,102 @@ class MultiAgentTrainer:
 
         return {k: np.mean(v) for k, v in all_stats.items()}
 
+    def evaluate(self, num_episodes=20, ablate_comm=False):
+        """Evaluate agents with optional communication ablation.
+
+        Args:
+            num_episodes: Number of episodes to evaluate.
+            ablate_comm: If True, zero out partner messages.
+        Returns:
+            Dict with mean returns for each agent and combined.
+        """
+        returns_a, returns_b = [], []
+        successes = []
+
+        for ep in range(num_episodes):
+            env = MultiAgentWrapper(
+                size=self.corridor_size,
+                corridor_length=3,
+                max_steps=self.max_steps,
+                seed=self.config['experiment']['seed'] + 100_000 + ep,
+                corridor_width=self.corridor_width,
+                asymmetric_info=self.config['env'].get('asymmetric_info', False),
+                rendezvous_bonus=self.rendezvous_bonus,
+                num_obstacles=self.num_obstacles,
+                bus_cost_solo=self.bus_cost_solo,
+                bus_cost_shared=self.bus_cost_shared,
+                bus_window=self.bus_window,
+                turn_taking=self.turn_taking,
+            )
+            (obs_a, obs_b), _ = env.reset()
+            obs = [
+                torch.from_numpy(obs_a).unsqueeze(0).to(self.device),
+                torch.from_numpy(obs_b).unsqueeze(0).to(self.device),
+            ]
+            msg_dim = self.config['communication']['message_length'] * self.config['communication']['vocab_size']
+            partner_msg = [
+                torch.zeros(1, msg_dim).to(self.device),
+                torch.zeros(1, msg_dim).to(self.device),
+            ]
+            goal = [
+                torch.zeros(1, self.config['manager']['goal_dim']).to(self.device),
+                torch.zeros(1, self.config['manager']['goal_dim']).to(self.device),
+            ]
+            ep_reward = [0.0, 0.0]
+            step = 0
+            done = False
+
+            while not done and step < self.max_steps:
+                with torch.no_grad():
+                    feats = [self.encoders[a](obs[a]) for a in range(2)]
+
+                    if step % self.goal_period == 0:
+                        for a in range(2):
+                            partner = 1 - a
+                            if ablate_comm:
+                                p_embed = torch.zeros(
+                                    1, self.config['manager']['goal_dim']
+                                ).to(self.device)
+                            else:
+                                p_embed = self.comm_channels[partner].embed_message(
+                                    partner_msg[partner]
+                                )
+                            g, _, _, _ = self.managers[a](feats[a], received_message=p_embed)
+                            msg_oh, _, _ = self.comm_channels[a].encode(g)
+                            goal[a] = F.normalize(
+                                self.comm_channels[a].decode(msg_oh), dim=-1
+                            )
+                            partner_msg[a] = msg_oh.detach()
+
+                    acts = []
+                    for a in range(2):
+                        action, _, _ = self.workers[a](feats[a], goal[a])
+                        acts.append(action.item())
+
+                (obs_a, obs_b), (rew_a, rew_b), terminated, truncated, info = env.step(
+                    tuple(acts)
+                )
+                obs = [
+                    torch.from_numpy(obs_a).unsqueeze(0).to(self.device),
+                    torch.from_numpy(obs_b).unsqueeze(0).to(self.device),
+                ]
+                ep_reward[0] += rew_a
+                ep_reward[1] += rew_b
+                done = terminated or truncated
+                step += 1
+
+            returns_a.append(ep_reward[0])
+            returns_b.append(ep_reward[1])
+            successes.append(float(((ep_reward[0] + ep_reward[1]) / 2.0) > 0.0))
+
+        return {
+            'mean_return_a': np.mean(returns_a),
+            'mean_return_b': np.mean(returns_b),
+            'mean_return': np.mean([(a + b) / 2 for a, b in zip(returns_a, returns_b)]),
+            'std_return': np.std([(a + b) / 2 for a, b in zip(returns_a, returns_b)]),
+            'success_rate': np.mean(successes) if successes else 0.0,
+        }
+
     def train(self, output_dir='outputs', wandb_run=None):
         os.makedirs(output_dir, exist_ok=True)
 
@@ -485,11 +682,21 @@ class MultiAgentTrainer:
 
         all_returns = []
         all_messages = []
+        all_states = []
+        all_decoded_goals = []
+        all_temporal_extents = []
+        recent_recon_loss = []
 
         print(f"Training mode: social (2 agents)")
         print(f"Total timesteps: {self.total_timesteps}")
         print(f"Num updates: {num_updates}")
         print(f"Device: {self.device}")
+        if self.intrinsic_anneal:
+            print(f"Intrinsic reward annealing: {self.intrinsic_coef} -> 0 over {self.intrinsic_anneal_steps} steps")
+        if self.listener_reward_coef > 0:
+            print(f"Listener reward coefficient: {self.listener_reward_coef}")
+        if self.comm_ablation:
+            print(f"Communication ablation: will evaluate with/without comm at end")
         print()
 
         ppo_cfg = self.config['ppo']
@@ -502,12 +709,32 @@ class MultiAgentTrainer:
                 for pg in self.optimizer.param_groups:
                     pg['lr'] = lr
 
-            worker_rollouts, manager_rollouts, messages_log, ep_returns = self.collect_rollout()
+            (worker_rollouts, manager_rollouts, messages_log, states_log_batch,
+             ep_returns, per_env_extents) = self.collect_rollout()
             stats = self.update(worker_rollouts, manager_rollouts)
+            if per_env_extents:
+                all_temporal_extents.extend(per_env_extents)
 
             for a in range(2):
                 if messages_log[a]:
                     all_messages.extend(messages_log[a])
+                if states_log_batch[a]:
+                    all_states.extend(states_log_batch[a])
+                m_data = manager_rollouts[a] if manager_rollouts else None
+                if isinstance(m_data, dict) and 'goals' in m_data:
+                    # Agent-side goals are pre-bottleneck. Decode to see what
+                    # the worker actually consumes (unit-normalized, as used
+                    # everywhere else in the bottleneck path).
+                    with torch.no_grad():
+                        raw = F.normalize(m_data['goals'].detach(), dim=-1)
+                        msg_oh, _, _ = self.comm_channels[a].encode(raw)
+                        decoded = F.normalize(
+                            self.comm_channels[a].decode(msg_oh), dim=-1
+                        ).cpu().numpy()
+                    if decoded.ndim == 2 and len(decoded) > 0:
+                        all_decoded_goals.append(decoded)
+            if 'comm_recon_loss' in stats:
+                recent_recon_loss.append(stats['comm_recon_loss'])
             all_returns.extend(ep_returns)
 
             if update % self.config['experiment']['log_interval'] == 0:
@@ -529,6 +756,7 @@ class MultiAgentTrainer:
                         'sps': sps,
                         'learning_rate': lr,
                         'episodes': len(all_returns),
+                        'intrinsic_coef': self._get_intrinsic_coef(),
                     }
                     log_data.update(stats)
                     wandb_run.log(log_data, step=self.global_step)
@@ -537,10 +765,49 @@ class MultiAgentTrainer:
                 self.save(os.path.join(output_dir, f'checkpoint_{self.global_step}.pt'))
 
         self.save(os.path.join(output_dir, 'final.pt'))
+        final_eval = self.evaluate(num_episodes=self.eval_episodes, ablate_comm=False)
+        print(
+            f"Final eval: return={final_eval['mean_return']:.3f} +/- "
+            f"{final_eval['std_return']:.3f} | success={100 * final_eval['success_rate']:.1f}%"
+        )
 
+        # Communication ablation evaluation
+        comm_eval = None
+        if self.comm_ablation:
+            print("\n--- Communication Ablation Evaluation ---")
+            eval_with_comm = final_eval
+            eval_without_comm = self.evaluate(
+                num_episodes=self.eval_episodes, ablate_comm=True
+            )
+            print(f"  With comm:    return={eval_with_comm['mean_return']:.3f} +/- {eval_with_comm['std_return']:.3f}")
+            print(f"  Without comm: return={eval_without_comm['mean_return']:.3f} +/- {eval_without_comm['std_return']:.3f}")
+            print(f"  Delta: {eval_with_comm['mean_return'] - eval_without_comm['mean_return']:.3f}")
+            comm_eval = {
+                'with_comm': eval_with_comm,
+                'without_comm': eval_without_comm,
+                'delta': eval_with_comm['mean_return'] - eval_without_comm['mean_return'],
+            }
+
+            if wandb_run is not None:
+                wandb_run.summary['eval_with_comm'] = eval_with_comm['mean_return']
+                wandb_run.summary['eval_without_comm'] = eval_without_comm['mean_return']
+                wandb_run.summary['comm_ablation_delta'] = (
+                    eval_with_comm['mean_return'] - eval_without_comm['mean_return']
+                )
+
+        decoded_goals_arr = (
+            np.concatenate(all_decoded_goals, axis=0)
+            if all_decoded_goals else None
+        )
         return {
             'returns': all_returns,
             'messages': all_messages,
+            'states': all_states,
+            'decoded_goals': decoded_goals_arr,
+            'recon_loss_mean': float(np.mean(recent_recon_loss[-50:])) if recent_recon_loss else None,
+            'temporal_extent_mean': float(np.mean(all_temporal_extents)) if all_temporal_extents else None,
+            'eval': final_eval,
+            'comm_ablation_eval': comm_eval,
         }
 
     def save(self, path):

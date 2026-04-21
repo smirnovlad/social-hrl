@@ -1,6 +1,5 @@
+outputs/
 __pycache__/
 *.pyc
-.env
-outputs/
-wandb/
-=*
+*.pyo
+.DS_Store

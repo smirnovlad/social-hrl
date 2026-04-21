@@ -1,9 +1,10 @@
 """Single-agent HRL training loop.
 
-Supports three modes:
+Supports multiple modes:
 - flat: Standard PPO (no hierarchy, no goals)
-- continuous: HRL with continuous goals, TD3 manager + PPO worker
+- continuous: HRL with continuous goals, TD3 or SAC manager + PPO worker
 - discrete: HRL with discrete bottleneck goals, PPO for both
+- option_critic: HRL with learned termination via Option-Critic
 """
 
 import os
@@ -20,7 +21,8 @@ from models.worker import Worker
 from models.communication import CommunicationChannel
 from algos.ppo import compute_gae, ppo_update
 from algos.td3 import ManagerTD3
-from envs.wrappers import make_vec_env
+from analysis.goal_metrics import temporal_extent as _temporal_extent
+from envs.wrappers import make_env, make_vec_env
 
 
 class FlatPolicy(nn.Module):
@@ -60,17 +62,25 @@ class HRLTrainer:
     def __init__(self, config, mode='continuous', device='cuda', use_corridor=False):
         self.config = config
         self.mode = mode
+        self.use_corridor = use_corridor
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
 
         # Create environments
         env_cfg = config['env']
         ppo_cfg = config['ppo']
+        self.env_name = env_cfg['name']
+        self.max_steps = env_cfg.get('max_steps')
+        self.corridor_width = env_cfg.get('corridor_width', 3)
+        self.corridor_size = env_cfg.get('corridor_size', 11)
+        self.eval_episodes = config['experiment'].get('eval_episodes', 20)
         if use_corridor:
             from envs.multi_agent_env import make_corridor_vec_env
             self.envs = make_corridor_vec_env(
                 ppo_cfg['num_envs'],
                 seed=config['experiment']['seed'],
                 max_steps=env_cfg.get('max_steps', 200),
+                corridor_width=self.corridor_width,
+                corridor_size=self.corridor_size,
             )
         else:
             self.envs = make_vec_env(
@@ -85,6 +95,11 @@ class HRLTrainer:
         self.num_envs = ppo_cfg['num_envs']
         self.num_steps = ppo_cfg['num_steps']
         self.goal_period = config['manager']['goal_period']
+
+        # Option-Critic and SAC flags
+        self.use_option_critic = config['manager'].get('use_option_critic', False)
+        sac_cfg = config.get('sac', {})
+        self.use_sac = sac_cfg.get('enabled', False) and mode == 'continuous'
 
         # Build models
         if mode == 'flat':
@@ -119,16 +134,65 @@ class HRLTrainer:
                 list(self.goal_projection.parameters())
             )
 
-            if mode == 'continuous':
-                # TD3 for the manager (off-policy, handles sparse updates)
-                self.manager_td3 = ManagerTD3(
-                    state_dim=hidden_dim,
+            if self.use_option_critic:
+                # Option-Critic: learned termination
+                from models.option_critic import OptionCriticManager
+                oc_cfg = config['manager'].get('option_critic', {})
+                self.option_critic = OptionCriticManager(
+                    input_dim=hidden_dim,
                     goal_dim=goal_dim,
+                    num_options=oc_cfg.get('num_options', 8),
                     hidden_dim=config['manager']['hidden_dim'],
-                    device=self.device,
-                    lr=ppo_cfg['lr'],
-                    gamma=ppo_cfg['gamma'],
+                    termination_reg=oc_cfg.get('termination_reg', 0.01),
+                ).to(self.device)
+
+                comm_cfg = config['communication']
+                self.comm_channel = CommunicationChannel(
+                    goal_dim=goal_dim,
+                    vocab_size=comm_cfg['vocab_size'],
+                    message_length=comm_cfg['message_length'],
+                    tau=comm_cfg['tau_start'],
+                ).to(self.device)
+                self.comm_optimizer = torch.optim.Adam(
+                    self.comm_channel.parameters(), lr=ppo_cfg['lr'], eps=1e-5
                 )
+
+                self.manager_optimizer = torch.optim.Adam(
+                    self.option_critic.parameters(), lr=ppo_cfg['lr'] * 0.1, eps=1e-5
+                )
+
+                self.tau_start = comm_cfg['tau_start']
+                self.tau_end = comm_cfg['tau_end']
+                self.tau_anneal_steps = comm_cfg['tau_anneal_steps']
+
+            elif mode == 'continuous':
+                if self.use_sac:
+                    from algos.sac import ManagerSAC
+                    self.manager_sac = ManagerSAC(
+                        state_dim=hidden_dim,
+                        goal_dim=goal_dim,
+                        hidden_dim=config['manager']['hidden_dim'],
+                        device=self.device,
+                        lr=sac_cfg.get('lr', ppo_cfg['lr']),
+                        gamma=ppo_cfg['gamma'],
+                        tau=sac_cfg.get('tau', 0.005),
+                        alpha=sac_cfg.get('alpha', 0.2),
+                        auto_alpha=sac_cfg.get('auto_alpha', True),
+                        target_entropy=sac_cfg.get('target_entropy'),
+                        buffer_size=sac_cfg.get('buffer_size', 200000),
+                        batch_size=sac_cfg.get('batch_size', 256),
+                        warmup_steps=sac_cfg.get('warmup_steps', 1000),
+                    )
+                else:
+                    # TD3 for the manager (off-policy, handles sparse updates)
+                    self.manager_td3 = ManagerTD3(
+                        state_dim=hidden_dim,
+                        goal_dim=goal_dim,
+                        hidden_dim=config['manager']['hidden_dim'],
+                        device=self.device,
+                        lr=ppo_cfg['lr'],
+                        gamma=ppo_cfg['gamma'],
+                    )
 
             elif mode == 'discrete':
                 # PPO manager for discrete goals (Gumbel-Softmax makes it finite)
@@ -176,17 +240,37 @@ class HRLTrainer:
         self.intrinsic_coef = config['worker']['intrinsic_reward_coef']
         self.extrinsic_coef = config['worker']['extrinsic_reward_coef']
 
+        # Intrinsic reward annealing and warmup
+        self.intrinsic_anneal = config['worker'].get('intrinsic_anneal', False)
+        self.intrinsic_anneal_steps = config['worker'].get('intrinsic_anneal_steps', 500000)
+        self.intrinsic_warmup_steps = config['worker'].get('intrinsic_warmup_steps', 0)
+
         # Logging
         self.global_step = 0
         self.log = defaultdict(list)
 
-        # Persistent obs across rollouts
+        # Persistent obs and episode reward accumulators across rollouts
         obs, _ = self.envs.reset()
         self.obs = torch.from_numpy(obs).to(self.device)
+        self._episode_rewards = np.zeros(self.num_envs)
+
+    def _get_intrinsic_coef(self):
+        """Get current intrinsic reward coefficient (with warmup then optional anneal)."""
+        target = self.intrinsic_coef
+        # Warmup: linearly ramp from 0 to target
+        if self.intrinsic_warmup_steps > 0 and self.global_step < self.intrinsic_warmup_steps:
+            target = target * (self.global_step / self.intrinsic_warmup_steps)
+        # Anneal: decay from target to 0 (after warmup)
+        if self.intrinsic_anneal:
+            anneal_start = self.intrinsic_warmup_steps
+            elapsed = max(0, self.global_step - anneal_start)
+            frac = min(1.0, elapsed / self.intrinsic_anneal_steps)
+            target = target * (1.0 - frac)
+        return target
 
     def _anneal_tau(self):
-        """Anneal Gumbel-Softmax temperature (discrete mode only)."""
-        if self.mode != 'discrete':
+        """Anneal Gumbel-Softmax temperature (discrete/option_critic mode only)."""
+        if self.mode not in ('discrete',) and not self.use_option_critic:
             return
         frac = min(1.0, self.global_step / self.tau_anneal_steps)
         tau = self.tau_start + frac * (self.tau_end - self.tau_start)
@@ -212,7 +296,6 @@ class HRLTrainer:
         val_buf = torch.zeros(self.num_steps, self.num_envs).to(self.device)
 
         obs = self.obs
-        episode_rewards = np.zeros(self.num_envs)
         episode_returns = []
 
         for step in range(self.num_steps):
@@ -228,11 +311,11 @@ class HRLTrainer:
             rew_buf[step] = torch.from_numpy(reward).float().to(self.device)
             done_buf[step] = torch.from_numpy(done).float().to(self.device)
 
-            episode_rewards += reward
+            self._episode_rewards += reward
             for i, d in enumerate(done):
                 if d:
-                    episode_returns.append(episode_rewards[i])
-                    episode_rewards[i] = 0
+                    episode_returns.append(self._episode_rewards[i])
+                    self._episode_rewards[i] = 0
 
             obs = torch.from_numpy(next_obs).to(self.device)
             self.global_step += self.num_envs
@@ -271,7 +354,7 @@ class HRLTrainer:
         return {k: np.mean(v) for k, v in all_stats.items()}
 
     # ------------------------------------------------------------------
-    # HRL rollout collection (shared by continuous and discrete)
+    # HRL rollout collection (shared by continuous, discrete, option_critic)
     # ------------------------------------------------------------------
 
     def collect_rollout_hrl(self):
@@ -288,24 +371,32 @@ class HRLTrainer:
         w_val_buf = torch.zeros(T, N).to(self.device)
 
         # Manager buffers — per-environment
-        # For continuous (TD3): store (state, goal, reward, next_state, done) transitions
-        # For discrete (PPO): store per-env data for GAE
         m_feat_buf = [[] for _ in range(N)]
         m_goal_buf = [[] for _ in range(N)]
+        m_goal_mean_buf = [[] for _ in range(N)]  # For comm channel training
         m_rew_buf = [[] for _ in range(N)]
         m_done_buf = [[] for _ in range(N)]
-        # PPO-specific (discrete only)
-        m_logp_buf = [[] for _ in range(N)] if self.mode == 'discrete' else None
-        m_val_buf = [[] for _ in range(N)] if self.mode == 'discrete' else None
+        # PPO-specific (discrete/option_critic only)
+        is_ppo_manager = self.mode == 'discrete' or self.use_option_critic
+        m_logp_buf = [[] for _ in range(N)] if is_ppo_manager else None
+        m_val_buf = [[] for _ in range(N)] if is_ppo_manager else None
 
-        messages_log = [] if self.mode == 'discrete' else None
+        # Option-Critic specific buffers
+        m_beta_buf = [[] for _ in range(N)] if self.use_option_critic else None
+        m_option_buf = [[] for _ in range(N)] if self.use_option_critic else None
+
+        messages_log = [] if (self.mode == 'discrete' or self.use_option_critic) else None
+        states_log = [] if (self.mode == 'discrete' or self.use_option_critic) else None
 
         obs = self.obs
         current_goal = torch.zeros(N, self.config['manager']['goal_dim']).to(self.device)
         manager_extrinsic_reward = torch.zeros(N).to(self.device)
         steps_since_goal = torch.zeros(N, dtype=torch.long).to(self.device)
 
-        episode_rewards = np.zeros(N)
+        # Option-Critic state
+        if self.use_option_critic:
+            current_option = torch.zeros(N, dtype=torch.long).to(self.device)
+
         episode_returns = []
 
         for step in range(T):
@@ -314,14 +405,62 @@ class HRLTrainer:
             with torch.no_grad():
                 features = self.encoder(obs)
 
-            # Manager decision every c steps
-            needs_new_goal = (steps_since_goal % self.goal_period == 0)
+            # Determine which envs need a new goal
+            if self.use_option_critic:
+                if step == 0:
+                    needs_new_goal = torch.ones(N, dtype=torch.bool, device=self.device)
+                    betas = torch.zeros(N, device=self.device)
+                else:
+                    terminate, betas = self.option_critic.should_terminate(features, current_option)
+                    needs_new_goal = terminate | (steps_since_goal == 0)
+            else:
+                needs_new_goal = (steps_since_goal % self.goal_period == 0)
 
             if needs_new_goal.any():
-                if self.mode == 'continuous':
-                    # TD3 deterministic policy + exploration noise
+                if self.use_option_critic:
+                    # Option-Critic: select option with learned termination
                     with torch.no_grad():
-                        goal = self.manager_td3.select_goal(features, add_noise=True)
+                        option, log_prob, value, goal = self.option_critic(features)
+                        self._anneal_tau()
+                        msg_onehot, msg_indices, _ = self.comm_channel.encode(goal)
+                        decoded_goal = F.normalize(self.comm_channel.decode(msg_onehot), dim=-1)
+
+                    new_option = torch.where(needs_new_goal, option, current_option)
+                    new_goal = torch.where(
+                        needs_new_goal.unsqueeze(-1).expand_as(decoded_goal),
+                        decoded_goal, current_goal
+                    )
+
+                    if messages_log is not None:
+                        messages_log.append(msg_indices[needs_new_goal].cpu().numpy())
+                    if states_log is not None:
+                        states_log.append(features[needs_new_goal].detach().cpu().numpy())
+
+                    for i in range(N):
+                        if needs_new_goal[i]:
+                            m_feat_buf[i].append(features[i])
+                            m_goal_buf[i].append(goal[i])
+                            m_logp_buf[i].append(log_prob[i])
+                            m_val_buf[i].append(value[i])
+                            m_rew_buf[i].append(manager_extrinsic_reward[i].clone())
+                            m_done_buf[i].append(torch.tensor(0.0, device=self.device))
+                            m_option_buf[i].append(option[i])
+                            m_beta_buf[i].append(betas[i])
+                            manager_extrinsic_reward[i] = 0.0
+
+                    current_option = new_option
+                    current_goal = new_goal
+                    steps_since_goal = torch.where(needs_new_goal,
+                                                    torch.zeros_like(steps_since_goal),
+                                                    steps_since_goal)
+
+                elif self.mode == 'continuous':
+                    # TD3 or SAC deterministic/stochastic policy + exploration
+                    with torch.no_grad():
+                        if self.use_sac:
+                            goal = self.manager_sac.select_goal(features, add_noise=True)
+                        else:
+                            goal = self.manager_td3.select_goal(features, add_noise=True)
                     new_goal = torch.where(
                         needs_new_goal.unsqueeze(-1).expand_as(goal),
                         goal, current_goal
@@ -337,28 +476,33 @@ class HRLTrainer:
 
                 elif self.mode == 'discrete':
                     with torch.no_grad():
-                        goal, log_prob, value, _ = self.manager(features)
+                        goal, log_prob, value, goal_mean = self.manager(features)
                     self._anneal_tau()
                     with torch.no_grad():
-                        msg_onehot, msg_indices, _ = self.comm_channel.encode(goal)
-                        decoded_goal = self.comm_channel.decode(msg_onehot)
+                        # Use goal_mean for comm channel (consistent with eval)
+                        msg_onehot, msg_indices, _ = self.comm_channel.encode(goal_mean)
+                        decoded_goal = F.normalize(self.comm_channel.decode(msg_onehot), dim=-1)
                     new_goal = torch.where(
                         needs_new_goal.unsqueeze(-1).expand_as(decoded_goal),
                         decoded_goal, current_goal
                     )
                     if messages_log is not None:
                         messages_log.append(msg_indices[needs_new_goal].cpu().numpy())
+                    if states_log is not None:
+                        states_log.append(features[needs_new_goal].detach().cpu().numpy())
                     for i in range(N):
                         if needs_new_goal[i]:
                             m_feat_buf[i].append(features[i])
                             m_goal_buf[i].append(goal[i])
+                            m_goal_mean_buf[i].append(goal_mean[i])
                             m_logp_buf[i].append(log_prob[i])
                             m_val_buf[i].append(value[i])
                             m_rew_buf[i].append(manager_extrinsic_reward[i].clone())
                             m_done_buf[i].append(torch.tensor(0.0, device=self.device))
                             manager_extrinsic_reward[i] = 0.0
 
-                current_goal = new_goal
+                if not self.use_option_critic:
+                    current_goal = new_goal
 
             w_goal_buf[step] = current_goal
 
@@ -381,7 +525,7 @@ class HRLTrainer:
             with torch.no_grad():
                 next_features = self.encoder(next_obs_t)
                 intrinsic_reward = self._compute_intrinsic_reward(next_features, current_goal)
-            worker_reward = self.intrinsic_coef * intrinsic_reward + self.extrinsic_coef * reward_t
+            worker_reward = self._get_intrinsic_coef() * intrinsic_reward + self.extrinsic_coef * reward_t
 
             w_rew_buf[step] = worker_reward
             w_done_buf[step] = done_t
@@ -389,23 +533,25 @@ class HRLTrainer:
             # Accumulate extrinsic reward for manager
             manager_extrinsic_reward += reward_t
 
-            episode_rewards += reward
+            self._episode_rewards += reward
             for i, d in enumerate(done):
                 if d:
-                    episode_returns.append(episode_rewards[i])
-                    episode_rewards[i] = 0
+                    episode_returns.append(self._episode_rewards[i])
+                    self._episode_rewards[i] = 0
                     steps_since_goal[i] = 0
-                    # Mark last manager entry as terminal
-                    if self.mode == 'discrete' and m_done_buf[i]:
+                    if self.use_option_critic:
+                        if m_done_buf[i]:
+                            m_done_buf[i][-1] = torch.tensor(1.0, device=self.device)
+                    elif self.mode == 'discrete' and m_done_buf[i]:
                         m_done_buf[i][-1] = torch.tensor(1.0, device=self.device)
                     elif self.mode == 'continuous' and m_done_buf[i]:
                         m_done_buf[i][-1] = 1.0
-                    # Zero manager reward — the terminal step reward is a small
-                    # fraction of the total period reward and leaving it causes
-                    # it to leak into the next episode's first transition as done=0.
                     manager_extrinsic_reward[i] = 0
 
-            steps_since_goal += 1
+            if not self.use_option_critic:
+                steps_since_goal += 1
+            else:
+                steps_since_goal += 1
             obs = next_obs_t
             self.global_step += self.num_envs
 
@@ -424,25 +570,31 @@ class HRLTrainer:
         # Build manager data depending on mode
         manager_data = {}
 
-        if self.mode == 'continuous':
-            # Feed transitions to TD3 replay buffer
+        if self.mode == 'continuous' and not self.use_option_critic:
+            # Feed transitions to TD3/SAC replay buffer
+            manager_obj = self.manager_sac if self.use_sac else self.manager_td3
+            all_cont_goals = []
             for i in range(N):
                 n_events = len(m_feat_buf[i])
                 if n_events < 2:
                     continue
                 for j in range(n_events - 1):
-                    self.manager_td3.add_transition(
+                    manager_obj.add_transition(
                         state=m_feat_buf[i][j].unsqueeze(0),
                         goal=m_goal_buf[i][j].unsqueeze(0),
-                        reward=torch.tensor([m_rew_buf[i][j + 1]]),  # reward during goal j
+                        reward=torch.tensor([m_rew_buf[i][j + 1]]),
                         next_state=m_feat_buf[i][j + 1].unsqueeze(0),
-                        done=torch.tensor([m_done_buf[i][j]]),  # episode ended during goal j?
+                        done=torch.tensor([m_done_buf[i][j]]),
                     )
+                all_cont_goals.append(torch.stack(m_goal_buf[i]))
+            if all_cont_goals:
+                manager_data = {'goals': torch.cat(all_cont_goals)}
 
-        elif self.mode == 'discrete':
+        elif self.mode == 'discrete' or self.use_option_critic:
             # Build PPO data for manager
             all_m_features, all_m_goals, all_m_logprobs = [], [], []
             all_m_advantages, all_m_returns = [], []
+            all_m_options = [] if self.use_option_critic else None
 
             for i in range(N):
                 n_events = len(m_val_buf[i])
@@ -460,6 +612,15 @@ class HRLTrainer:
                 all_m_logprobs.append(torch.stack(m_logp_buf[i][:-1]))
                 all_m_advantages.append(adv)
                 all_m_returns.append(ret)
+                if self.use_option_critic:
+                    all_m_options.append(torch.stack(m_option_buf[i][:-1]))
+
+            # Collect goal_means for comm channel training
+            all_m_goal_means = []
+            if self.mode == 'discrete':
+                for i in range(N):
+                    if len(m_goal_mean_buf[i]) >= 2:
+                        all_m_goal_means.append(torch.stack(m_goal_mean_buf[i][:-1]))
 
             if all_m_advantages:
                 manager_data = {
@@ -469,6 +630,20 @@ class HRLTrainer:
                     'advantages': torch.cat(all_m_advantages),
                     'returns': torch.cat(all_m_returns),
                 }
+                if all_m_goal_means:
+                    manager_data['goal_means'] = torch.cat(all_m_goal_means)
+                if self.use_option_critic and all_m_options:
+                    manager_data['options'] = torch.cat(all_m_options)
+
+        # Compute temporal_extent correctly: the per-env per-step goal sequence
+        # (w_goal_buf[:, i, :]) is the object whose persistence we care about.
+        # Flattening messages across envs makes consecutive entries cross-env,
+        # not temporal, which reports extent ~= 1 regardless of behavior.
+        goal_seq = w_goal_buf.detach().cpu().numpy()  # (T, N, D)
+        per_env_extents = [
+            float(_temporal_extent(goal_seq[:, i, :], threshold=0.01))
+            for i in range(N)
+        ]
 
         return {
             'worker': {
@@ -481,6 +656,8 @@ class HRLTrainer:
             },
             'manager': manager_data,
             'messages': messages_log,
+            'states': states_log,
+            'per_env_temporal_extents': per_env_extents,
         }, episode_returns
 
     # ------------------------------------------------------------------
@@ -511,15 +688,16 @@ class HRLTrainer:
                     all_stats[f'worker_{k}'].append(v)
 
         # Manager update
-        if self.mode == 'continuous':
-            # TD3 updates (multiple gradient steps per rollout)
+        if self.mode == 'continuous' and not self.use_option_critic:
+            # TD3/SAC updates
+            manager_obj = self.manager_sac if self.use_sac else self.manager_td3
             for _ in range(self.goal_period):
-                td3_stats = self.manager_td3.update()
-                if td3_stats is not None:
-                    for k, v in td3_stats.items():
+                mgr_stats = manager_obj.update()
+                if mgr_stats is not None:
+                    for k, v in mgr_stats.items():
                         all_stats[k].append(v)
 
-        elif self.mode == 'discrete':
+        elif self.mode == 'discrete' or self.use_option_critic:
             m_data = rollout['manager']
             if m_data and m_data.get('advantages') is not None:
                 M = m_data['advantages'].shape[0]
@@ -537,10 +715,17 @@ class HRLTrainer:
                                 'returns': m_data['returns'][mb_idx],
                                 'goals': m_data['goals'][mb_idx],
                             }
-                            def manager_policy_fn(b):
-                                return self.manager.evaluate_actions(
-                                    b['obs_features'], b['goals']
-                                )
+                            if self.use_option_critic:
+                                batch['options'] = m_data['options'][mb_idx]
+                                def manager_policy_fn(b):
+                                    return self.option_critic.evaluate_actions(
+                                        b['obs_features'], b['options']
+                                    )
+                            else:
+                                def manager_policy_fn(b):
+                                    return self.manager.evaluate_actions(
+                                        b['obs_features'], b['goals']
+                                    )
                             stats = ppo_update(
                                 batch, manager_policy_fn, self.manager_optimizer,
                                 0.1, self.entropy_coef * 0.1, self.value_coef, self.max_grad_norm
@@ -548,12 +733,47 @@ class HRLTrainer:
                             for k, v in stats.items():
                                 all_stats[f'manager_{k}'].append(v)
 
-            # Communication channel reconstruction loss
-            # This is the ONLY way the sender/decoder get gradients
-            if m_data and m_data.get('goals') is not None:
-                raw_goals = m_data['goals'].detach()
+            # Option-Critic: also train Q-head (TD) and termination head.
+            # The PPO update above only touches policy_over_options and
+            # value_head; q_head and termination_head are untouched, so we
+            # need a separate gradient step or termination never learns and
+            # options churn at init bias sigmoid(-3) ≈ 0.05 forever.
+            if self.use_option_critic and m_data and m_data.get('options') is not None:
+                feats = m_data['features']
+                opts = m_data['options']
+                returns = m_data['returns'].detach()
+                advantages = m_data['advantages'].detach()
+
+                q_pred = self.option_critic.q_for(feats, opts)
+                q_loss = F.mse_loss(q_pred, returns)
+                term_loss = self.option_critic.termination_loss(
+                    feats, opts, advantages
+                )
+                oc_loss = q_loss + term_loss
+
+                self.manager_optimizer.zero_grad()
+                oc_loss.backward()
+                nn.utils.clip_grad_norm_(
+                    self.option_critic.parameters(), self.max_grad_norm
+                )
+                self.manager_optimizer.step()
+
+                with torch.no_grad():
+                    mean_beta = self.option_critic.beta_for(feats, opts).mean().item()
+                all_stats['oc_q_loss'].append(q_loss.item())
+                all_stats['oc_term_loss'].append(term_loss.item())
+                all_stats['oc_mean_beta'].append(mean_beta)
+
+            # Communication channel reconstruction loss.
+            # Normalize goals to the unit sphere before passing through the
+            # bottleneck: otherwise recon_loss + sender_entropy has a trivial
+            # minimum at raw_goals -> 0 (encoder logits uniform, decoder outputs
+            # zeros), causing silent magnitude collapse in goal space.
+            comm_goals = m_data.get('goal_means', m_data.get('goals'))
+            if m_data and comm_goals is not None:
+                raw_goals = F.normalize(comm_goals.detach(), dim=-1)
                 msg_onehot, _, logits = self.comm_channel.encode(raw_goals)
-                reconstructed = self.comm_channel.decode(msg_onehot)
+                reconstructed = F.normalize(self.comm_channel.decode(msg_onehot), dim=-1)
                 recon_loss = F.mse_loss(reconstructed, raw_goals)
 
                 # Sender entropy bonus to encourage diverse messages
@@ -572,6 +792,110 @@ class HRLTrainer:
         return {k: np.mean(v) for k, v in all_stats.items()}
 
     # ------------------------------------------------------------------
+    # Evaluation
+    # ------------------------------------------------------------------
+
+    def _make_eval_env(self, seed):
+        """Create a single evaluation environment."""
+        if self.use_corridor:
+            from envs.multi_agent_env import SingleAgentCorridorEnv
+
+            return SingleAgentCorridorEnv(
+                size=self.corridor_size,
+                corridor_length=3,
+                max_steps=self.max_steps or 200,
+                corridor_width=self.corridor_width,
+            )
+        return make_env(self.env_name, seed=seed, max_steps=self.max_steps)()
+
+    def _select_flat_action(self, obs):
+        features = self.flat_policy.encoder(obs)
+        logits = self.flat_policy.policy(features)
+        return logits.argmax(dim=-1)
+
+    def _select_worker_action(self, features, goal):
+        logits = self.worker.policy(torch.cat([features, goal], dim=-1))
+        return logits.argmax(dim=-1)
+
+    def _select_discrete_goal(self, features):
+        _, _, _, goal_mean = self.manager(features)
+        msg_onehot, _ = self.comm_channel.encode_deterministic(goal_mean)
+        return F.normalize(self.comm_channel.decode(msg_onehot), dim=-1)
+
+    def _select_option_goal(self, features, current_option=None, steps_since_goal=0):
+        if current_option is None:
+            option_logits = self.option_critic.policy_over_options(features)
+            current_option = option_logits.argmax(dim=-1)
+        elif steps_since_goal > 0:
+            term_logits = self.option_critic.termination_head(features)
+            beta = torch.sigmoid(
+                term_logits.gather(1, current_option.unsqueeze(-1)).squeeze(-1)
+            )
+            if bool((beta > 0.5).item()):
+                option_logits = self.option_critic.policy_over_options(features)
+                current_option = option_logits.argmax(dim=-1)
+
+        goal = self.option_critic.option_goals(current_option)
+        msg_onehot, _ = self.comm_channel.encode_deterministic(goal)
+        return current_option, F.normalize(self.comm_channel.decode(msg_onehot), dim=-1)
+
+    def evaluate(self, num_episodes=20):
+        """Evaluate the current policy on the training task."""
+        returns = []
+        successes = []
+        base_seed = self.config['experiment']['seed'] + 100_000
+
+        for episode in range(num_episodes):
+            env = self._make_eval_env(base_seed + episode)
+            obs, _ = env.reset(seed=base_seed + episode)
+            obs_t = torch.from_numpy(obs).unsqueeze(0).to(self.device)
+            current_goal = None
+            current_option = None
+            steps_since_goal = 0
+            done = False
+            ep_return = 0.0
+
+            while not done:
+                with torch.no_grad():
+                    if self.mode == 'flat':
+                        action = self._select_flat_action(obs_t)
+                    else:
+                        features = self.encoder(obs_t)
+                        if self.use_option_critic:
+                            current_option, current_goal = self._select_option_goal(
+                                features, current_option=current_option,
+                                steps_since_goal=steps_since_goal,
+                            )
+                        elif self.mode == 'continuous' and current_goal is None:
+                            manager = self.manager_sac if self.use_sac else self.manager_td3
+                            current_goal = manager.select_goal(features, add_noise=False)
+                        elif self.mode == 'continuous' and steps_since_goal % self.goal_period == 0:
+                            manager = self.manager_sac if self.use_sac else self.manager_td3
+                            current_goal = manager.select_goal(features, add_noise=False)
+                        elif self.mode == 'discrete' and (
+                            current_goal is None or steps_since_goal % self.goal_period == 0
+                        ):
+                            current_goal = self._select_discrete_goal(features)
+
+                        action = self._select_worker_action(features, current_goal)
+
+                next_obs, reward, terminated, truncated, _ = env.step(action.item())
+                done = terminated or truncated
+                ep_return += reward
+                obs_t = torch.from_numpy(next_obs).unsqueeze(0).to(self.device)
+                steps_since_goal += 1
+
+            env.close()
+            returns.append(ep_return)
+            successes.append(float(ep_return > 0.0))
+
+        return {
+            'mean_return': float(np.mean(returns)) if returns else 0.0,
+            'std_return': float(np.std(returns)) if returns else 0.0,
+            'success_rate': float(np.mean(successes)) if successes else 0.0,
+        }
+
+    # ------------------------------------------------------------------
     # Training loop
     # ------------------------------------------------------------------
 
@@ -583,11 +907,21 @@ class HRLTrainer:
 
         all_returns = []
         all_messages = []
+        all_states = []
+        all_decoded_goals = []
+        all_temporal_extents = []
+        recent_recon_loss = []
+        recent_mean_beta = []
 
-        print(f"Training mode: {self.mode}")
+        mode_name = 'option_critic' if self.use_option_critic else self.mode
+        if self.use_sac:
+            mode_name = 'sac_continuous'
+        print(f"Training mode: {mode_name}")
         print(f"Total timesteps: {self.total_timesteps}")
         print(f"Num updates: {num_updates}")
         print(f"Device: {self.device}")
+        if self.intrinsic_anneal:
+            print(f"Intrinsic reward annealing: {self.intrinsic_coef} -> 0 over {self.intrinsic_anneal_steps} steps")
         print()
 
         lr = self.config['ppo']['lr']
@@ -600,7 +934,7 @@ class HRLTrainer:
                 if self.mode == 'flat':
                     for pg in self.optimizer.param_groups:
                         pg['lr'] = lr
-                elif self.mode in ('continuous', 'discrete'):
+                elif self.mode in ('continuous', 'discrete') or self.use_option_critic:
                     for pg in self.worker_optimizer.param_groups:
                         pg['lr'] = lr
 
@@ -613,6 +947,22 @@ class HRLTrainer:
                 stats = self.update_hrl(rollout)
                 if rollout.get('messages') and rollout['messages']:
                     all_messages.extend(rollout['messages'])
+                if rollout.get('states') and rollout['states']:
+                    all_states.extend(rollout['states'])
+                # For collapse analysis: retain the realized (post-bottleneck)
+                # goals that the worker actually conditioned on during the
+                # rollout. This is the object whose collapse matters.
+                m_data = rollout.get('manager') or {}
+                if isinstance(m_data, dict) and 'goals' in m_data:
+                    g = m_data['goals'].detach().cpu().numpy()
+                    if g.ndim == 2 and len(g) > 0:
+                        all_decoded_goals.append(g)
+                if 'comm_recon_loss' in stats:
+                    recent_recon_loss.append(stats['comm_recon_loss'])
+                if 'oc_mean_beta' in stats:
+                    recent_mean_beta.append(stats['oc_mean_beta'])
+                if rollout.get('per_env_temporal_extents'):
+                    all_temporal_extents.extend(rollout['per_env_temporal_extents'])
 
             all_returns.extend(ep_returns)
 
@@ -637,6 +987,7 @@ class HRLTrainer:
                         'sps': sps,
                         'learning_rate': lr,
                         'episodes': len(all_returns),
+                        'intrinsic_coef': self._get_intrinsic_coef(),
                     }
                     log_data.update(stats)
                     wandb_run.log(log_data, step=self.global_step)
@@ -647,10 +998,25 @@ class HRLTrainer:
 
         # Final save
         self.save(os.path.join(output_dir, 'final.pt'))
+        final_eval = self.evaluate(num_episodes=self.eval_episodes)
+        print(
+            f"Final eval: return={final_eval['mean_return']:.3f} +/- "
+            f"{final_eval['std_return']:.3f} | success={100 * final_eval['success_rate']:.1f}%"
+        )
 
+        decoded_goals_arr = (
+            np.concatenate(all_decoded_goals, axis=0)
+            if all_decoded_goals else None
+        )
         return {
             'returns': all_returns,
             'messages': all_messages,
+            'states': all_states,
+            'decoded_goals': decoded_goals_arr,
+            'recon_loss_mean': float(np.mean(recent_recon_loss[-50:])) if recent_recon_loss else None,
+            'mean_beta': float(np.mean(recent_mean_beta[-50:])) if recent_mean_beta else None,
+            'temporal_extent_mean': float(np.mean(all_temporal_extents)) if all_temporal_extents else None,
+            'eval': final_eval,
         }
 
     # ------------------------------------------------------------------
@@ -662,6 +1028,8 @@ class HRLTrainer:
             'mode': self.mode,
             'global_step': self.global_step,
             'config': self.config,
+            'use_option_critic': self.use_option_critic,
+            'use_sac': self.use_sac,
         }
 
         if self.mode == 'flat':
@@ -672,8 +1040,17 @@ class HRLTrainer:
             state['worker'] = self.worker.state_dict()
             state['goal_projection'] = self.goal_projection.state_dict()
             state['worker_optimizer'] = self.worker_optimizer.state_dict()
-            if self.mode == 'continuous':
-                state['manager_td3'] = self.manager_td3.state_dict()
+
+            if self.use_option_critic:
+                state['option_critic'] = self.option_critic.state_dict()
+                state['manager_optimizer'] = self.manager_optimizer.state_dict()
+                state['comm_channel'] = self.comm_channel.state_dict()
+                state['comm_optimizer'] = self.comm_optimizer.state_dict()
+            elif self.mode == 'continuous':
+                if self.use_sac:
+                    state['manager_sac'] = self.manager_sac.state_dict()
+                else:
+                    state['manager_td3'] = self.manager_td3.state_dict()
             elif self.mode == 'discrete':
                 state['manager'] = self.manager.state_dict()
                 state['manager_optimizer'] = self.manager_optimizer.state_dict()
@@ -695,8 +1072,16 @@ class HRLTrainer:
             if 'goal_projection' in state:
                 self.goal_projection.load_state_dict(state['goal_projection'])
             self.worker_optimizer.load_state_dict(state['worker_optimizer'])
-            if self.mode == 'continuous' and 'manager_td3' in state:
-                self.manager_td3.load_state_dict(state['manager_td3'])
+
+            if self.use_option_critic and 'option_critic' in state:
+                self.option_critic.load_state_dict(state['option_critic'])
+                self.manager_optimizer.load_state_dict(state['manager_optimizer'])
+                self.comm_channel.load_state_dict(state['comm_channel'])
+            elif self.mode == 'continuous':
+                if self.use_sac and 'manager_sac' in state:
+                    self.manager_sac.load_state_dict(state['manager_sac'])
+                elif 'manager_td3' in state:
+                    self.manager_td3.load_state_dict(state['manager_td3'])
             elif self.mode == 'discrete':
                 self.manager.load_state_dict(state['manager'])
                 self.manager_optimizer.load_state_dict(state['manager_optimizer'])
