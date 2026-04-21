@@ -146,6 +146,8 @@ def topographic_similarity(messages, states, n_samples=5000):
     try:
         from scipy.stats import spearmanr
     except ImportError:
+        import warnings
+        warnings.warn('topographic_similarity: scipy not installed, returning 0.0')
         return 0.0
 
     messages_arr = np.array(messages)
@@ -205,6 +207,8 @@ def message_state_mutual_information(messages, states, n_bins=20):
         else:
             states_2d = states_arr
     except ImportError:
+        import warnings
+        warnings.warn('message_state_mutual_information: sklearn not installed, using manual SVD fallback')
         # Manual: take first 2 principal components via SVD
         states_centered = states_arr - states_arr.mean(axis=0)
         try:
@@ -293,6 +297,8 @@ def listener_accuracy_probe(messages, states, vocab_size=10, message_length=3,
         score = model.score(X_test, y_test)
         return max(0.0, float(score))
     except ImportError:
+        import warnings
+        warnings.warn('listener_accuracy_probe: sklearn not installed, using manual ridge (numerically different from sklearn)')
         # Manual ridge regression: w = (X^T X + alpha I)^-1 X^T y
         try:
             XtX = X_train.T @ X_train + 1.0 * np.eye(X_train.shape[1])

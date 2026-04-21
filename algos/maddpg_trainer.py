@@ -72,14 +72,15 @@ class CentralizedQCritic(nn.Module):
 
 
 class ReplayBuffer:
-    def __init__(self, capacity):
+    def __init__(self, capacity, seed=None):
         self.buf = deque(maxlen=capacity)
+        self._rng = random.Random(seed)
 
     def push(self, transition):
         self.buf.append(transition)
 
     def sample(self, batch_size):
-        batch = random.sample(self.buf, batch_size)
+        batch = self._rng.sample(self.buf, batch_size)
         return batch
 
     def __len__(self):
@@ -173,7 +174,7 @@ class MaddpgTrainer:
         self.gumbel_tau = 1.0
         # Standard MADDPG hyperparams.
         self.batch_size = 64
-        self.buffer = ReplayBuffer(capacity=50_000)
+        self.buffer = ReplayBuffer(capacity=50_000, seed=self.seed)
         self.warmup_steps = 500
         self.update_every = 4
         self.global_step = 0

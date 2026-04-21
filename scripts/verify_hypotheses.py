@@ -97,7 +97,10 @@ def build_config(total_timesteps, corridor_size, mode, seed, corridor_width=3,
             'message_length': message_length,
             'tau_start': 1.0,
             'tau_end': 0.3,
-            'tau_anneal_steps': max(total_timesteps // 2, 2000),
+            # Anneal tau across ~80% of training so the codebook stabilizes
+            # before the bottleneck hardens. At 15k this was pre-annealing
+            # (1.0 -> 0.3 over 7.5k) before the channel had converged.
+            'tau_anneal_steps': max(int(total_timesteps * 0.8), 10_000),
             'listener_reward_coef': 0.0,
             'ablation_mode': (mode in SOCIAL_MODES),
         },
@@ -130,7 +133,9 @@ def build_config(total_timesteps, corridor_size, mode, seed, corridor_width=3,
         'lola': {
             'coef': 1.0,
             'inner_lr': 1e-3,
-            'warmup_updates': 5,
+            # 5 was too aggressive: second-order correction fired before
+            # sender/decoder had converged. 50 lets the channel settle first.
+            'warmup_updates': 50,
         },
         'experiment': {
             'seed': seed,
