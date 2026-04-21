@@ -23,7 +23,13 @@ from models.manager import Manager
 from models.worker import Worker
 from models.communication import CommunicationChannel
 from algos.ppo import compute_gae, ppo_update
-from analysis.goal_metrics import temporal_extent as _temporal_extent
+from analysis.goal_metrics import (
+    temporal_extent as _temporal_extent,
+    goal_entropy,
+    goal_coverage,
+    goal_space_coverage,
+    goal_vector_std,
+)
 from envs.multi_agent_env import MultiAgentWrapper
 
 
@@ -760,6 +766,19 @@ class MultiAgentTrainer:
                     }
                     if hasattr(self, 'comm_channels') and self.comm_channels:
                         log_data['gumbel_tau'] = float(self.comm_channels[0].tau.item())
+                    if all_messages:
+                        flat = [m for batch in all_messages
+                                if isinstance(batch, np.ndarray) for m in batch]
+                        if len(flat) >= 10:
+                            log_data['goal_msg_entropy'] = goal_entropy(flat)
+                            log_data['goal_msg_coverage'] = goal_coverage(flat)
+                    if all_decoded_goals:
+                        goals_cat = np.concatenate(all_decoded_goals, axis=0)
+                        if len(goals_cat) >= 2:
+                            log_data['goal_space_coverage'] = goal_space_coverage(goals_cat)
+                            log_data['goal_vector_std'] = goal_vector_std(goals_cat)
+                    if all_temporal_extents:
+                        log_data['temporal_extent'] = float(np.mean(all_temporal_extents[-200:]))
                     log_data.update(stats)
                     wandb_run.log(log_data, step=self.global_step)
 
