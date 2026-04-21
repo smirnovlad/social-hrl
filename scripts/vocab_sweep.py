@@ -65,9 +65,13 @@ def main():
 
     rows = []
     t_start = time.time()
+    os.environ.setdefault(
+        'WANDB_RUN_GROUP',
+        f'vocab_sweep-ts{args.timesteps}-{time.strftime("%Y%m%d-%H%M%S")}')
     for K, L in VOCAB_GRID:
         for mode in MODES:
             tag = f'K{K}_L{L}__{mode}'
+            os.environ['WANDB_TAGS'] = f'vocab_sweep,K{K},L{L}'
             print(f'\n[vocab] === {tag} ===')
             out = os.path.join(root, tag)
             # Social gets 2x timesteps to amortize 2-agent training overhead.

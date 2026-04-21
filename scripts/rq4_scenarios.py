@@ -45,6 +45,8 @@ print(f'[rq4] output: {os.path.join(ROOT, TS)}')
 # scenario -> seed -> run_dir
 run_map = defaultdict(dict)
 t_start = time.time()
+sweep_group = os.environ.get('WANDB_RUN_GROUP',
+                             f'rq4_scenarios-ts{TIMESTEPS}-{TS}')
 for scen_name, scen_cfg in SCENARIOS.items():
     for seed in SEEDS:
         out = os.path.join(ROOT, TS, scen_name, f'seed-{seed}')
@@ -64,9 +66,12 @@ for scen_name, scen_cfg in SCENARIOS.items():
             cmd += ['--bus-window', str(scen_cfg['bus_window'])]
         if scen_cfg['turn_taking']:
             cmd.append('--turn-taking')
+        env = {**os.environ,
+               'WANDB_RUN_GROUP': sweep_group,
+               'WANDB_TAGS': f'rq4,{scen_name}'}
         t0 = time.time()
         print(f'[rq4] scen={scen_name} seed={seed} ...', flush=True)
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env)
         dt = time.time() - t0
         print(f'[rq4] scen={scen_name} seed={seed} done in {dt:.1f}s '
               f'(rc={result.returncode})', flush=True)

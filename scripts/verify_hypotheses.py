@@ -47,6 +47,57 @@ from algos.multi_agent_trainer import MultiAgentTrainer
 from algos.lola_trainer import LolaMultiAgentTrainer
 from analysis.goal_metrics import compute_all_metrics
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
+WANDB_ENTITY = 'mbzuai-research'
+WANDB_PROJECT = 'social-hrl'
+
+
+def _init_wandb(mode, seed, total_timesteps, cfg, run_name, group):
+    """Init a wandb run for one (mode, seed). Returns the run or None.
+
+    Skipped if: wandb not installed, WANDB_MODE=disabled set by caller, or
+    WANDB_API_KEY missing. All other control lives in env (WANDB_MODE,
+    WANDB_RUN_GROUP, WANDB_TAGS) so subprocess callers inherit behavior.
+    """
+    if wandb is None:
+        return None
+    if os.environ.get('WANDB_MODE', '').lower() == 'disabled':
+        return None
+    if not os.environ.get('WANDB_API_KEY') and not os.path.exists(
+            os.path.expanduser('~/.netrc')):
+        return None
+    try:
+        return wandb.init(
+            entity=WANDB_ENTITY,
+            project=WANDB_PROJECT,
+            name=run_name,
+            group=group,
+            job_type=mode,
+            config={
+                'mode': mode,
+                'seed': seed,
+                'total_timesteps': total_timesteps,
+                'corridor_size': cfg['env']['corridor_size'],
+                'corridor_width': cfg['env']['corridor_width'],
+                'bus_cost_solo': cfg['env'].get('bus_cost_solo', 0.0),
+                'bus_cost_shared': cfg['env'].get('bus_cost_shared', 0.0),
+                'bus_window': cfg['env'].get('bus_window', 0),
+                'turn_taking': cfg['env'].get('turn_taking', False),
+                'vocab_size': cfg['communication']['vocab_size'],
+                'message_length': cfg['communication']['message_length'],
+                'tau_anneal_steps': cfg['communication']['tau_anneal_steps'],
+            },
+            tags=os.environ.get('WANDB_TAGS', '').split(',') if os.environ.get('WANDB_TAGS') else None,
+            reinit=True,
+        )
+    except Exception as e:
+        print(f'[verify] wandb init failed, running without wandb: {e}')
+        return None
+
 
 DEFAULT_MODES = ['continuous', 'discrete', 'social']
 SOCIAL_MODES = {'social', 'lola'}
@@ -186,9 +237,15 @@ def run_mode(mode, total_timesteps, corridor_size, seed, out_dir, device,
     else:
         trainer = HRLTrainer(cfg, mode=mode, device=device, use_corridor=True)
 
+    # Per-(mode, seed) wandb run. Group is inherited from WANDB_RUN_GROUP so
+    # a mini_sweep or rq4 invocation groups all its seeds/modes under one roof.
+    run_name = f'{mode}-seed{seed}-ts{total_timesteps}'
+    group = os.environ.get('WANDB_RUN_GROUP', f'verify-{time.strftime("%Y%m%d-%H%M%S")}')
+    wandb_run = _init_wandb(mode, seed, total_timesteps, cfg, run_name, group)
+
     log_path = os.path.join(out_dir, f'{mode}.log')
     with open(log_path, 'w') as f, redirect_stdout(f):
-        results = trainer.train(output_dir=out_dir, wandb_run=None)
+        results = trainer.train(output_dir=out_dir, wandb_run=wandb_run)
     elapsed = time.time() - t0
 
     # Flatten messages and states
@@ -236,6 +293,12 @@ def run_mode(mode, total_timesteps, corridor_size, seed, out_dir, device,
 
     with open(os.path.join(out_dir, f'{mode}_metrics.json'), 'w') as f:
         json.dump(metrics, f, indent=2, default=float)
+
+    if wandb_run is not None:
+        for k, v in metrics.items():
+            if isinstance(v, (int, float)) and v == v:  # skip NaN
+                wandb_run.summary[k] = v
+        wandb_run.finish()
     return metrics
 
 

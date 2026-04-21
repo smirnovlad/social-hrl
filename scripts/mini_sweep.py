@@ -28,6 +28,8 @@ os.makedirs(ROOT, exist_ok=True)
 
 run_dirs = []
 t_start = time.time()
+sweep_group = os.environ.get('WANDB_RUN_GROUP',
+                             f'mini_sweep-ts{TIMESTEPS}-{time.strftime("%Y%m%d-%H%M%S")}')
 for seed in SEEDS:
     out = os.path.join(ROOT, f'seed-{seed}')
     os.makedirs(out, exist_ok=True)
@@ -43,8 +45,9 @@ for seed in SEEDS:
     ]
     if USE_BUS:
         cmd.append('--bus')
+    env = {**os.environ, 'WANDB_RUN_GROUP': sweep_group}
     t0 = time.time()
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, env=env)
     print(f'[sweep] seed={seed} done in {time.time() - t0:.1f}s '
           f'(rc={result.returncode})', flush=True)
     if result.returncode != 0:
