@@ -1,8 +1,13 @@
 # Environment
 env:
   name: "MiniGrid-KeyCorridorS3R2-v0"  # Start simpler, scale up
-  max_steps: 500
+  max_steps: 200
   fully_observable: false  # partial observability (7x7 agent view)
+  corridor_size: 11        # grid size for corridor-based tasks
+  corridor_width: 3        # 1 for narrow (blocking/coordination), 3 for wide
+  asymmetric_info: false   # in corridor social mode, agent 1 cannot see goal tiles
+  rendezvous_bonus: 0.0    # bonus when both agents are in corridor simultaneously
+  num_obstacles: 0         # random wall obstacles placed in rooms
 
 # Architecture
 encoder:
@@ -13,11 +18,18 @@ manager:
   goal_dim: 16
   hidden_dim: 128
   goal_period: 10  # c = manager acts every 10 steps
+  use_option_critic: false  # learned termination instead of fixed period
+  option_critic:
+    num_options: 8
+    termination_reg: 0.01   # regularize toward not terminating prematurely
 
 worker:
   hidden_dim: 128
-  intrinsic_reward_coef: 1.0
+  intrinsic_reward_coef: 0.1
   extrinsic_reward_coef: 1.0
+  intrinsic_anneal: false         # anneal intrinsic_reward_coef from initial to 0
+  intrinsic_anneal_steps: 500000  # steps over which to anneal
+  intrinsic_warmup_steps: 200000  # linearly ramp intrinsic from 0 to target
 
 communication:
   vocab_size: 10  # K
@@ -25,6 +37,8 @@ communication:
   tau_start: 1.0  # Gumbel-Softmax temperature
   tau_end: 0.1
   tau_anneal_steps: 200000
+  listener_reward_coef: 0.0  # reward agent for partner following its message
+  ablation_mode: false       # zero out communication at eval time
 
 # PPO
 ppo:
@@ -42,11 +56,31 @@ ppo:
   total_timesteps: 1000000
   anneal_lr: true
 
+# SAC (alternative to TD3 for continuous manager)
+sac:
+  enabled: false
+  lr: 0.0003
+  alpha: 0.2            # initial entropy coefficient
+  auto_alpha: true       # auto-tune entropy coefficient
+  target_entropy: null   # null = -goal_dim (heuristic)
+  tau: 0.005             # Polyak averaging
+  buffer_size: 200000
+  batch_size: 256
+  warmup_steps: 1000
+
 # Multi-agent
 multi_agent:
   num_agents: 2
   shared_critic: true
   comm_reward_coef: 0.1  # bonus for successful coordination
+  listener_reward_coef: 0.0  # reward for partner following message
+
+# Transfer
+transfer:
+  freeze_manager: true
+  freeze_comm: true
+  freeze_encoder: true    # false = fine-tune encoder on target env
+  freeze_worker: false    # worker always trainable
 
 # Experiment
 experiment:

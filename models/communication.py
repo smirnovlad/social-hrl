@@ -141,6 +141,22 @@ class CommunicationChannel(nn.Module):
         """
         return self.message_embedder(message_onehot)
 
+    def encode_deterministic(self, goal):
+        """Deterministic encoding for eval: argmax without Gumbel noise.
+
+        Args:
+            goal: (batch, goal_dim) continuous goal vector.
+        Returns:
+            message_onehot: (batch, L * K) concatenated one-hot vectors.
+            message_indices: (batch, L) discrete token indices.
+        """
+        raw = self.sender(goal)
+        logits = raw.view(-1, self.message_length, self.vocab_size)
+        indices = logits.argmax(dim=-1)  # (batch, L)
+        onehot = F.one_hot(indices, self.vocab_size).float()  # (batch, L, K)
+        message_onehot = onehot.view(-1, self.message_length * self.vocab_size)
+        return message_onehot, indices
+
     def set_tau(self, tau):
         """Update Gumbel-Softmax temperature."""
         self.tau.fill_(tau)
