@@ -1,12 +1,15 @@
-"""3-seed mini-sweep: 4-way comparison (discrete / social / lola / maddpg).
+"""3-seed mini-sweep: 6-way comparison across all modes.
 
-Runs verify_hypotheses (--stress, --bus, --modes discrete social lola maddpg)
-for each seed, then aggregates the main metrics with mean and std across
-seeds. Replaces the previous single-seed headline so RQ1/RQ2 verdicts rest
-on statistical evidence, not one lucky draw.
+Default modes: flat, continuous, discrete, social, lola, maddpg. Rationale
+for including flat + continuous: the H1 story ("discrete bottleneck prevents
+goal collapse") requires continuous as the collapse reference and flat as
+the no-hierarchy baseline for the return curve.
+
+Runs verify_hypotheses (--stress, --bus) for each (seed, mode) and
+aggregates the main metrics with mean and std across seeds.
 
 Usage:
-    python scripts/mini_sweep.py                  # default 3 seeds, 4 modes
+    python scripts/mini_sweep.py                  # default 3 seeds, 6 modes
     MODES="discrete social"  python scripts/mini_sweep.py  # subset via env var
 """
 import json
@@ -19,7 +22,8 @@ from collections import defaultdict
 import numpy as np
 
 SEEDS = [42, 7, 123]
-MODES = os.environ.get('MODES', 'discrete social lola maddpg').split()
+MODES = os.environ.get('MODES',
+                       'flat continuous discrete social lola maddpg').split()
 TIMESTEPS = int(os.environ.get('TIMESTEPS', '15000'))
 USE_BUS = os.environ.get('USE_BUS', '1') == '1'
 ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
