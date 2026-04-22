@@ -331,7 +331,7 @@ A reasonable interpretation, supported by Chaabouni et al.~\citeyearpar{chaaboun
 \begin{figure}[h]
 \centering
 \includegraphics[width=0.98\columnwidth]{figs/fig6_sanity.pdf}
-\caption{\textbf{Training sanity checks}: Gumbel-Softmax temperature anneal schedule (target floor $\tau = 0.3$) and channel reconstruction MSE over training, 3 seeds per mode. $\tau$ reaches its floor before the end of each run (${\sim}80$k for discrete, ${\sim}200$k for social/LOLA); the discrete reconstruction loss collapses to ${\sim}5{\times}10^{-4}$ within 20k steps, while social and LOLA plateau near $0.05$ (two orders of magnitude higher), consistent with the lower $I(\text{goal}; \text{msg})$ of the two-agent channels.
+\caption{\textbf{Training sanity checks}: Gumbel-Softmax temperature anneal schedule (target floor $\tau = 0.3$, reached at step 83{,}200 for 100k-step runs and step 204{,}800 for 250k-step runs) and channel reconstruction MSE over training, 3 seeds per mode. The discrete reconstruction loss drops below $5{\times}10^{-3}$ within 20k steps and reaches ${\sim}4{\times}10^{-4}$ by the end of training, while social and LOLA plateau near $0.05$ (two orders of magnitude higher), consistent with the lower $I(\text{goal}; \text{msg})$ of the two-agent channels.
 }
 \label{fig:sanity}
 \end{figure}
