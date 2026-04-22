@@ -8,13 +8,14 @@
 \usepackage{natbib}
 \usepackage{enumitem}
 \usepackage{caption}
+\usepackage{xcolor}
 
 \setlength{\parskip}{0.3em}
 \setlength{\parindent}{0em}
 \setlength{\bibsep}{0.2em}
 
 \title{\textbf{Social Interaction as Regularization\\for Hierarchical Reinforcement Learning}\\[0.3em]
-\large ML8103 Sequential Decision Making --- Final Report}
+\large ML8103 Sequential Decision Making --- Progress Report}
 
 \author{Vladislav Smirnov \qquad Mirat Aubakirov\\[0.3em]
 \textit{Mohamed bin Zayed University of Artificial Intelligence}}
@@ -24,330 +25,488 @@
 \begin{document}
 \maketitle
 
+\begin{abstract}
+\noindent We study whether a second, communicating agent can act as a
+regularizer for hierarchical RL and prevent \emph{goal collapse}. On
+a two-agent corridor with randomized goals and mutual goal-masking,
+we compare four conditions (flat PPO, HRL with continuous goals,
+HRL with a discrete Gumbel-Softmax bottleneck, and HRL with a
+communicating partner) across four research questions: goal collapse,
+transfer, vocabulary compositionality, and coordination scenarios. We
+introduce two diagnostics --- a scramble ablation (random real
+messages in place of the partner's real message) and joint-goal
+coverage (union rather than pooled) --- that cleanly separate
+``channel carries causal information'' from ``channel is simply
+decoded.'' A 78-job parallel sweep across 3 seeds per condition gives
+the headline result: the discrete bottleneck robustly prevents
+collapse, but a communicating partner does \emph{not} produce a
+general advantage over a solo discrete agent. Social and discrete
+tie on single-agent transfer ($-0.70 \pm 0.09$), and only a strict
+coordination scenario (\texttt{bus\_strict}) reliably makes the
+partner channel load-bearing.
+\end{abstract}
+
 \section{Introduction}
 
-In hierarchical RL, a manager network picks subgoals and a worker network executes low-level actions~\citep{nachum2018hiro, vezhnevets2017feudal, bacon2017option}. The common failure case is \textbf{goal collapse}: the manager learns to output the same goal every time, which makes the hierarchy useless.
+In hierarchical RL, a manager picks subgoals and a worker executes
+low-level actions~\citep{nachum2018hiro, vezhnevets2017feudal,
+bacon2017option}. The common failure case is \textbf{goal collapse}:
+the manager learns to output the same goal every time, which makes
+the hierarchy useless.
 
-We try two things to fix this. First, we route goals through a \textbf{discrete bottleneck} (Gumbel-Softmax) that forces the manager to pick from a finite set of 1000 messages instead of outputting a continuous vector. Second, we add a \textbf{second agent} that reads the same messages, hoping that the need to coordinate would push goals toward something meaningful.
+We consider two interventions. (1) A \textbf{discrete bottleneck}
+via Gumbel-Softmax~\citep{jang2017gumbel}, which forces the manager
+to pick from a finite codebook instead of emitting a continuous
+vector. (2) A \textbf{second agent} that reads the same messages,
+hoping that coordination pressure pushes codes toward something more
+than a private index.
 
-The second idea did not work the way we expected. The discrete bottleneck alone already prevents collapse almost perfectly. Adding a partner actually reduces goal diversity slightly --- agents develop efficient codes rather than diverse ones.
+The first intervention reliably fixes collapse: discrete and social
+managers both reach near-full entropy over a 1000-code codebook,
+while a continuous manager collapses to zero entropy. The question
+this report focuses on is whether the \emph{social} variant
+contributes anything beyond the discrete one. The answer we reach is
+``only under narrow conditions, and not in general'' --- and the
+methodological steps we take to isolate that answer (scramble
+ablation, joint-goal coverage, partner-message replay at transfer
+time) are as much a contribution as the numbers.
+
+\paragraph{Research questions.}
+\begin{itemize}[nosep]
+\item \textbf{RQ1} --- Does the communicating partner (social)
+prevent goal collapse more robustly than the discrete bottleneck
+alone?
+\item \textbf{RQ2} --- Does a social-trained manager transfer better
+to a single-agent target task than a discrete-trained one?
+\item \textbf{RQ3} --- How does bottleneck capacity ($K \times L$:
+vocabulary $\times$ message length) shape compositionality and
+channel utility?
+\item \textbf{RQ4} --- Which coordination scenarios (plain bus,
+strict bus with synchronization window, turn-taking) actually make
+the partner channel load-bearing?
+\end{itemize}
+
+\paragraph{Contributions.} (1) A two-agent corridor where the
+partner channel is the \emph{only} route to partner-goal information
+(randomized goals, own-goal-masked partial view).
+(2) A scramble ablation and a joint-goal coverage metric that avoid
+two common artifacts (out-of-distribution input at ablation time,
+and pooled-coverage punishing agents that occupy distinct regions).
+(3) A 78-job parallel sweep across 3 seeds per cell showing that the
+discrete bottleneck result is robust, while the social-over-discrete
+advantage is limited to specific scenarios and compositional
+capacities.
 
 \section{Method}
 
 \subsection{Environment}
 
-We built a custom 11$\times$11 MiniGrid corridor environment (Figure~\ref{fig:arch}a). Two rooms are connected by a 3-cell-wide passage. The agent starts top-left and has to reach the bottom-right room. Observations are partial (7$\times$7 view). The agent gets $-0.01$ per step and $+1.0$ for reaching the goal. In the two-agent version, agents start in opposite rooms and each has to cross to the other side. They get a $+0.5$ bonus if both finish. Max episode length is 500 steps.
+We use a 9$\times$9 two-agent corridor (Figure~\ref{fig:arch}a). Two
+rooms are connected by a 3-cell passage. Agents start on opposite
+sides and each must reach a randomized goal in the other room.
+Observations are partial (7$\times$7), rewards are $-0.01$ per step
+and $+1.0$ for reaching the goal, with a joint $+0.5$ bonus if both
+finish. Max episode length is 500 steps. For RQ2's single-agent
+target task we use a wider \texttt{SingleAgentCorridor-S15-W3-v0}
+(same family, larger corridor).
 
-We picked this environment because the corridor creates a natural bottleneck where agents have to pass each other, which is where coordination should matter. The downside (which we only discovered after running experiments) is that flat PPO solves it trivially --- 99.3\% success from the start. More on this in Section~\ref{sec:discussion}.
+Two environmental properties are critical and distinguish this task
+from prior HRL corridors in which the partner channel has nothing to
+convey:
+
+\begin{itemize}[nosep]
+\item \textbf{Randomized goals}: goal cells resample each episode,
+so a partner's goal varies episode-to-episode.
+\item \textbf{Mutual goal masking}: each agent's partial view masks
+\emph{its own} goal tile; the partner's goal remains visible to the
+partner. The only path to information about where an agent must go
+is the partner's message.
+\end{itemize}
+
+For RQ4 we vary one additional knob: the partner-message bus that
+feeds the manager the partner's last message (optionally window-
+averaged over $w=4$ steps). Scenarios are \texttt{baseline}
+(no bus), \texttt{bus} (last-message bus), \texttt{bus\_strict}
+(last-message bus plus a requirement to synchronize arrival within
+4 steps), and \texttt{turn\_taking} (sequential arrival mandated
+exogenously).
 
 \subsection{Conditions}
 
-Table~\ref{tab:conditions} lists the six setups we compared. The first wave of experiments (March, 1M timesteps, no-stress corridor) covered the four core HRL conditions; the second wave (April, 100k timesteps, \emph{stress} corridor) added two coordination-aware baselines, LOLA and MADDPG, and re-ran all six modes under a harder configuration designed to keep flat PPO from trivially solving the task.
+Table~\ref{tab:conditions} lists the four methods compared on RQ1.
+Only \texttt{discrete} and \texttt{social} expose a message
+bottleneck, so RQ2--RQ4 compare those two.
 
 \begin{table}[h]
 \centering
 \small
-\caption{The six conditions. GS = Gumbel-Softmax. CTDE = centralised training, decentralised execution.}
+\caption{The four conditions. GS = Gumbel-Softmax.}
 \label{tab:conditions}
-\begin{tabular}{@{}lllc@{}}
+\begin{tabular}{@{}llll@{}}
 \toprule
 Condition & Manager & Goals & Agents \\
 \midrule
-Flat PPO        & ---     & ---                                & 1 \\
-HRL Continuous  & TD3     & $\mathbf{g} \in [-1,1]^{16}$       & 1 \\
-HRL Discrete    & PPO+GS  & $\mathbf{m} \in \{1,...,10\}^3$    & 1 \\
-HRL Social      & PPO+GS  & $\mathbf{m} \in \{1,...,10\}^3$    & 2 \\
-HRL+LOLA        & PPO+GS  & $\mathbf{m} \in \{1,...,10\}^3$    & 2 \\
-MADDPG          & ---     & continuous action (CTDE)           & 2 \\
+Flat PPO        & ---     & ---                            & 1 \\
+HRL Continuous  & PPO     & $\mathbf{g}\in[-1,1]^{16}$      & 1 \\
+HRL Discrete    & PPO+GS  & $\mathbf{m}\in\{1,\dots,10\}^3$ & 1 \\
+HRL Social      & PPO+GS  & $\mathbf{m}\in\{1,\dots,10\}^3$ & 2 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-To make the comparison between discrete and social fair, we created a single-agent version of the same corridor layout. Both conditions see the same grid, same observations, same rewards. The only difference is whether a second agent is present.
-
-\paragraph{Stress configuration.} The April runs use a harder variant of the corridor: extended episode horizon, an additional wall configuration, and (in two-agent modes) a \emph{bus} sub-task that forces both agents to traverse the same narrow cell within a small time window. This configuration was chosen because the original corridor was solved by flat PPO from the first epoch, leaving no head-room to compare HRL conditions on task performance. Stress runs train for 100k timesteps for flat, continuous, discrete, and MADDPG, and for 250k timesteps for social and LOLA to amortise the larger two-agent rollout cost. Vocabulary and transfer sweeps train for 60k; coordination scenarios for 12k. All sweeps use 3 random seeds (42, 123, 7) per cell unless noted.
-
 \subsection{Architecture}
 
-Figure~\ref{fig:arch}b shows how the pieces fit together. A 3-layer CNN (16/32/64 channels) maps the 7$\times$7$\times$3 MiniGrid observation to 128-dim features, with per-channel normalization (dividing by the max value for each channel: 10 for object type, 5 for color, 2 for state).
-
-The \textbf{manager} is a small MLP that outputs a 16-dim goal vector every $c=10$ worker steps. In continuous mode, it uses TD3~\citep{nachum2018hiro} with tanh output. In discrete mode, it uses PPO~\citep{schulman2017ppo} with a Gaussian policy.
-
-The \textbf{communication channel} sits between the manager and worker in discrete/social modes. It has three parts:
-\begin{itemize}[nosep]
-    \item A \textit{sender} (linear layer) that maps the 16-dim goal to $3 \times 10 = 30$ logits, reshaped as 3 categorical distributions over 10 tokens.
-    \item \textit{Gumbel-Softmax}~\citep{jang2017gumbel} sampling at each position --- hard one-hot in the forward pass, soft gradients backward. Temperature anneals linearly from 1.0 (exploratory) to a floor of 0.3 (near-hard): the floor is reached at ${\sim}80$k steps for the 100k-step runs and at ${\sim}200$k steps for the 250k-step runs (Figure~\ref{fig:sanity}a).
-    \item A \textit{decoder} (linear layer) that maps the 30-dim one-hot message back to a 16-dim goal for the worker.
-\end{itemize}
-
-The channel is trained with MSE reconstruction loss (decoded goal vs.\ raw goal) plus a sender entropy bonus (coefficient 0.05). It has its own Adam optimizer to keep its gradients separate from the rest of the network.
-
-The \textbf{worker} is a goal-conditioned policy that receives concatenated encoder features and the decoded goal. Its reward mixes an intrinsic term ($-\|\text{proj}(\phi(s)) - g\|$, pushing it to match the goal direction) with the extrinsic environment reward, both weighted equally.
-
-In \textbf{social mode}, two copies of this whole stack operate in the same environment. Each agent's manager gets the other agent's previous message (embedded and concatenated to its input). A shared centralized critic $V(o_A, o_B)$ sees both agents' observations for more stable training (CTDE paradigm from~\citet{lowe2017maddpg}). The idea that agents can learn from each other's behavior has also been explored in opponent modeling~\citep{foerster2018lola}, though we focus on communication rather than policy inference.
+A 3-layer CNN (16/32/64 channels) maps the 7$\times$7$\times$3 view
+to 128-dim features. The \textbf{manager} outputs a 16-dim goal every
+$c=8$ worker steps. In \texttt{continuous} mode the worker reads this
+directly; in \texttt{discrete}/\texttt{social} mode the goal passes
+through a sender $\to$ Gumbel-Softmax $\to$ decoder channel at
+$K=10, L=3$ (1000 codes). Temperature anneals $\tau: 1.0 \to 0.1$
+over 200K steps. The channel is trained with MSE reconstruction loss
+plus a sender entropy bonus (0.05). The \textbf{worker} is a
+goal-conditioned PPO policy whose reward mixes intrinsic
+($-\|\text{proj}(\phi(s)) - g\|$) with extrinsic, and whose
+intrinsic weight anneals to zero so late-training return is not
+confounded by the shaping bonus. In \texttt{social} mode two copies
+share the same environment, each manager receives the partner's last
+message through the bus, and a shared centralized critic
+$V(o_A, o_B)$ is used (CTDE, \citet{lowe2017maddpg}). We also ran
+baselines for MADDPG and LOLA~\citep{foerster2018lola}; they are on
+par with \texttt{continuous} and \texttt{social} respectively on
+return, and we omit them from the headline figures for space.
 
 \begin{figure}[t]
 \centering
 \small
 \begin{verbatim}
-(a) Corridor layout (11x11)
-  ###########
-  #...#.#...#
-  #.A.#.#...#   A = agent start
-  #...#.#...#   G = goal
-  #.........#   3-cell corridor
-  #.........#
-  #.........#
-  #...#.#.G.#
-  #...#.#...#
-  ###########
+(a) 9x9 corridor (two-agent)
+  ##########
+  #..A...#.#   A, B = start tiles
+  #......#.#   g_A, g_B = randomized goals
+  #......#.#   (masked in the owner's view)
+  #......#.#
+  #######..#
+  #.#....g_B#
+  #.#......#
+  #.#g_A....#
+  ##########
 
-(b) Discrete/Social architecture
+(b) Discrete / Social pipeline
   obs -> CNN -> features
                   |
-          Manager (every 10 steps)
+      Manager (every 8 steps; partner msg bus)
                   |
-            raw goal (R^16)
+            raw goal g (R^16)
                   |
-        Sender -> Gumbel-Softmax
+        Sender -> Gumbel-Softmax (K=10, L=3)
                   |
-          message m in {1..10}^3
+            message m in {1..10}^3
                   |
               Decoder
                   |
-         decoded goal -> Worker -> action
+         decoded g' -> Worker -> action
 \end{verbatim}
-\caption{(a) The corridor environment. (b) Data flow in discrete/social modes. In social mode, the partner's message is also fed to the manager.}
+\caption{(a) Two-agent corridor with randomized goals and mutual
+goal masking. (b) Data flow. In social mode, the partner's last
+message is also fed to the manager via a bus.}
 \label{fig:arch}
 \end{figure}
 
 \subsection{Metrics}
 
-We track three goal quality metrics:
+We track:
+
 \begin{itemize}[nosep]
-    \item \textbf{Goal entropy}: Shannon entropy of the message frequency distribution. Maximum is $3\ln 10 \approx 6.91$ (uniform over all 1000 messages).
-    \item \textbf{Unique messages}: how many of the 1000 possible messages appeared at least once during training.
-    \item \textbf{Coverage}: fraction of messages that were used more than once (filters out one-off noise).
+\item \textbf{Goal entropy}: Shannon entropy of message frequencies;
+max $3\ln 10 \approx 6.91$ for a uniform code.
+\item \textbf{Joint goal coverage}: fraction of the 16-dim goal
+space visited by \emph{either} agent, i.e.\ $|X_A \cup X_B|$ over
+the discretized goal space. This replaces pooled coverage
+(which treats both agents as one population and penalizes pairs
+that occupy distinct regions --- the opposite of the
+anti-collapse signal we want).
+\item \textbf{Scramble-$\Delta$}: eval-return difference between
+real partner messages and random real messages drawn from a replay
+bank. Positive values mean the channel carries causal information
+(scrambling hurts); near-zero means the decoder has learned the
+message distribution but the identity of the message does not
+matter.
+\item \textbf{Listener accuracy}: ridge-probe $R^2$ of goal from
+message.
+\item \textbf{Topographic similarity}: Spearman $\rho$ between goal
+distance and message edit distance.
+\item \textbf{Transfer eval}: mean return on the target task with
+encoder+manager+comm frozen and only the worker + goal projection
+fine-tuned.
 \end{itemize}
 
-We also report task performance (goal reach rate), though as we will see, it is less informative on this particular environment.
+\paragraph{Why scramble rather than zero.} A natural comm-ablation
+is to feed $\mathbf{0}$ in place of the partner message. This
+conflates ``the channel carries no information'' with ``the frozen
+manager is being fed out-of-distribution input.'' A random real
+message has the same marginal distribution as a true message but
+zero causal content, so the ablation measures information rather
+than distribution shift.
+
+\paragraph{Why joint coverage.} If agent A visits goal-space region
+$X_A$ and agent B visits $X_B$, pooling them penalizes the case
+$X_A \neq X_B$ --- which is exactly the non-collapsed outcome we
+want to detect. Joint coverage reports $|X_A \cup X_B|$.
 
 \section{Results}
 
+Each condition is run for 3 seeds and reported as mean $\pm$ standard
+deviation across seeds. Budgets: RQ1 and RQ2 sources at 200k
+timesteps; RQ2 transfer at 120k; RQ4 at 100k; RQ3 vocab sweep at
+60k. Raw outputs live under \texttt{outputs/long\_sweep/}.
+
+\subsection{RQ1 --- Does social prevent goal collapse?}
+
 \begin{figure*}[t]
 \centering
-\includegraphics[width=0.98\textwidth]{figs/fig1_main.pdf}
-\caption{\textbf{Main story (stress config, 3 seeds per mode, all panels clipped to 100k steps for fair comparison).}
-(a) Episode return over training --- only flat PPO makes any progress in this budget; the shaded envelope is the per-seed min/max to keep flat's large variance from crushing the HRL curves. Panels (b) and (c) use the conventional $\pm 1\sigma$ band across seeds.
-(b) Goal-message entropy of the 1000-message codebook --- discrete, social, and LOLA all saturate near the theoretical ceiling $\ln 1000 \approx 6.908$ (dashed line).
-(c) Goal-space coverage --- discrete saturates at $1.0$ (dashed), continuous plateaus near $0.49$, and the coordination-aware variants land in between (social ${\sim}0.72$, LOLA ${\sim}0.55$).
-}
-\label{fig:main-story}
+\includegraphics[width=\textwidth]{figs/fig1_rq1.pdf}
+\caption{RQ1 at 200k, 3 seeds. (a) Flat PPO has the highest return;
+all HRL variants plateau on this task. (b) Discrete and social reach
+$\sim 6.9$ nats --- near the $\ln(10^3)$ ceiling; continuous
+collapses to zero entropy. (c) Social's joint-goal coverage is 0.83
+(high), though seed variance is large.}
+\label{fig:rq1}
 \end{figure*}
 
-\subsection{Task performance}
-\label{sec:task-perf}
+Figure~\ref{fig:rq1}(b) shows the \textbf{discrete bottleneck
+result}: both discrete and social reach essentially full entropy over
+the 1000-code codebook, while continuous collapses to a single
+fixed output. This reproduces robustly and is the cleanest finding
+in the report.
 
-We report two batches of task results: the original 1M no-stress corridor (Table~\ref{tab:task-1m}) and the 100k stress corridor (Table~\ref{tab:task-stress}).
+The \textbf{social-over-discrete comparison is less clean}. Social
+maintains high joint coverage (0.83) but with a large seed spread
+($\pm 0.18$). Scramble-$\Delta$ for social at 200k straddles zero
+($-0.098 \pm 0.202$); one of three seeds has $\Delta = -0.331$
+(scrambled messages yielded \emph{better} return than real ones),
+two are near zero. The channel is not reliably load-bearing on the
+default RQ1 setup.
 
-\begin{table}[h]
-\centering
-\small
-\caption{Task performance, no-stress corridor, 1M steps (March wave).}
-\label{tab:task-1m}
-\begin{tabular}{@{}lcc@{}}
-\toprule
-Condition & Goal reach rate & Mean return \\
-\midrule
-Flat PPO        & 99.3\% $\pm$ 0.7\% & $+0.837$ \\
-HRL Continuous  & 51.2\% $\pm$ 7.4\% & $-0.430$ \\
-HRL Discrete    & 51.1\% $\pm$ 2.6\% & $-0.431$ \\
-HRL Social      & 45.6\% $\pm$ 3.5\% & $-0.582$ \\
-\bottomrule
-\end{tabular}
-\end{table}
+\textbf{Flat PPO still wins on return} ($-0.68 \pm 0.02$) ---
+the corridor does not require hierarchy, so return alone is not a
+discriminating signal between hierarchical conditions. Goal-quality
+metrics are.
 
-\begin{table}[h]
-\centering
-\small
-\caption{Task performance, stress corridor, April wave. 3 seeds per mode; final return is the mean of the last three logged points per run. Single-agent modes and MADDPG train for 100k steps; social and LOLA train for 250k. Eval is rolled out under the same stress config as training.}
-\label{tab:task-stress}
-\begin{tabular}{@{}lcc@{}}
-\toprule
-Condition & Eval success & Final return \\
-\midrule
-Flat PPO        & $0.67 \pm 0.47$ & $+0.640 \pm 0.877$ \\
-HRL Continuous  & $0.00 \pm 0.00$ & $-0.704 \pm 0.032$ \\
-HRL Discrete    & $0.00 \pm 0.00$ & $-0.729 \pm 0.017$ \\
-HRL Social      & $0.00 \pm 0.00$ & $-0.841 \pm 0.027$ \\
-HRL+LOLA        & $0.00 \pm 0.00$ & $-0.824 \pm 0.019$ \\
-MADDPG          & $0.00 \pm 0.00$ & $-0.800 \pm 0.000$ \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-On the no-stress corridor, flat PPO solves the task almost immediately while every HRL condition plateaus around 45--51\%. The hierarchy adds overhead (manager decisions every 10 steps, intrinsic reward optimization, communication channel) without providing any benefit on a task this easy. The stress configuration removes that ceiling: at the stress-config horizon no HRL variant completes a single evaluation episode, and even flat PPO is only intermittently successful --- two of three flat seeds solve the task (per-seed final returns $+1.26, +1.26, -0.60$), and the third collapses. 100k is plainly under-trained for HRL on the harder map; the value of the stress configuration in this report is that it lets us examine \emph{goal-space metrics} on a non-trivial task while excluding any ``flat already won'' confound.
-
-\subsection{H1: Does the discrete bottleneck help?}
-
-Yes, both batches agree. Under the no-stress 1M setting the continuous (TD3) manager collapses to a single fixed output --- goal entropy is literally zero --- while the Gumbel-Softmax channel uses all 1000 messages and reaches 97.5\% of maximum entropy. Under the stress setting the same pattern is sharper: \emph{goal-space coverage} (the fraction of a 16-bin partition of $[-1,1]^{16}$ ever visited) is $0.485 \pm 0.187$ for the continuous manager and saturates at $1.000 \pm 0.000$ for the discrete one. The discrete bottleneck makes goal collapse essentially impossible.
-
-\begin{table}[h]
-\centering
-\small
-\caption{Continuous vs.\ discrete goals across both waves.}
-\label{tab:h1}
-\begin{tabular}{@{}lcc@{}}
-\toprule
-Metric & Continuous & Discrete \\
-\midrule
-\multicolumn{3}{l}{\emph{1M no-stress, March}} \\
-Goal reach rate     & 51.2\%   & 51.1\% \\
-Goal entropy        & 0.000    & \textbf{6.73} \\
-\% of max entropy   & 0\%      & \textbf{97.5\%} \\
-Unique messages     & 0        & \textbf{1000/1000} \\
-\addlinespace
-\multicolumn{3}{l}{\emph{Stress, April (3 seeds, mean $\pm$ std)}} \\
-Goal-space coverage & $0.485 \pm 0.187$  & $\mathbf{1.000 \pm 0.000}$ \\
-Goal entropy (nats) & ---                & $\mathbf{6.865 \pm 0.000}$ \\
-$I(\text{goal}; \text{msg})$ & ---       & $\mathbf{1.575 \pm 0.222}$ \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-Why does this work? The Gumbel-Softmax forces the manager's continuous output through a categorical bottleneck. Even if the raw goals are similar, small differences get mapped to different tokens. The reconstruction loss then trains the decoder to spread these tokens across goal space, creating a 1000-way codebook. The entropy bonus on the sender prevents it from always picking the same few tokens.
-
-\subsection{H2: Does a partner agent help more?}
-
-No. Across both waves, adding a second agent does not improve goal-quality metrics --- if anything it slightly compresses them. The 1M no-stress numbers are in the top half of Table~\ref{tab:h2}; the 100k stress numbers are in the bottom half. Two stress findings worth flagging: goal-space coverage drops from $1.00$ (discrete) to $0.72$ (social), and per-message information content $I(\text{goal}; \text{msg})$ falls $5\times$ from $1.58$ to $0.31$ nats. We also include the LOLA variant (opponent-aware learning), which behaves like social mode rather than like discrete --- whatever effect coordination has on the channel, it is not specific to vanilla social play.
-
-\begin{table}[h]
-\centering
-\small
-\caption{Discrete (solo) vs.\ social and LOLA (two agents). Top block: 1M no-stress. Bottom block: 100k stress, 3 seeds (mean $\pm$ std).}
-\label{tab:h2}
-\begin{tabular}{@{}lccc@{}}
-\toprule
-Metric & Discrete & Social & LOLA \\
-\midrule
-\multicolumn{4}{l}{\emph{1M no-stress, March}} \\
-Goal reach rate     & 51.1\% & 45.6\%  & --- \\
-Goal entropy        & \textbf{6.73} & 6.21 & --- \\
-\% of max entropy   & \textbf{97.5\%} & 89.8\% & --- \\
-\addlinespace
-\multicolumn{4}{l}{\emph{Stress, April}} \\
-Goal-space coverage & $\mathbf{1.00 \pm 0.00}$ & $0.72 \pm 0.10$ & $0.55 \pm 0.06$ \\
-Goal entropy (nats) & $6.865 \pm 0.000$ & $6.895 \pm 0.002$ & $6.887 \pm 0.008$ \\
-$I(\text{goal}; \text{msg})$ & $\mathbf{1.575 \pm 0.222}$ & $0.312 \pm 0.030$ & $0.332 \pm 0.016$ \\
-Listener accuracy   & $\mathbf{0.248 \pm 0.058}$ & $0.049 \pm 0.025$ & $0.059 \pm 0.034$ \\
-Topographic sim.\   & $0.002 \pm 0.010$ & $-0.002 \pm 0.002$ & $0.015 \pm 0.005$ \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-We think this happens because coordination creates pressure to reuse messages that work, not to explore new ones. The agents settle on a smaller set of ``go-to'' messages for common situations, like how people use a small fraction of their vocabulary in daily conversation. This matches what Chaabouni et al.~\citeyearpar{chaabouni2020compositionality} found in emergent communication: agents under coordination pressure develop efficient codes, not diverse ones.
-
-The MI and listener-accuracy results add detail on top of that. The discrete (solo) channel carries roughly five times more bits per message about the underlying goal than the social channel does; a held-out ridge-regression listener can recover the goal direction from a discrete message with $R^2 \approx 0.25$, but only $0.05$ from a social message. Topographic similarity --- the Spearman correlation between message-edit distance and goal-vector distance --- is essentially zero in all conditions, so neither channel is compositional in any structured sense.
+\subsection{RQ2 --- Does the channel transfer to a single-agent task?}
 
 \begin{figure}[t]
 \centering
-\includegraphics[width=0.98\columnwidth]{figs/fig5_social_bars.pdf}
-\caption{\textbf{Social-family summary metrics} (100k, 3 seeds).
-Comm-ablation delta (return drop when the message is zeroed at eval), listener accuracy (ridge probe $R^2$), topographic similarity (Spearman $\rho$ between message-edit and goal-vector distance), and mutual information $I(\text{goal}; \text{msg})$. Discrete dominates social and LOLA on listener accuracy and MI by ${\sim}5\times$; topographic similarity is near zero in every condition.
-}
-\label{fig:social-bars}
-\end{figure}
-
-\subsection{H3: Transfer}
-
-We froze the encoder, manager, and communication channel from the trained discrete and social models, then retrained a fresh worker on a widened corridor (S11-W3) --- same family, different geometry. Three seeds per source condition, 60k steps each.
-
-\begin{figure}[h]
-\centering
-\includegraphics[width=0.9\columnwidth]{figs/fig3_transfer.pdf}
-\caption{\textbf{Transfer eval on widened-corridor target} (3 seeds, 60k steps, mean $\pm$ std).
-Discrete-source eval return is $-0.767 \pm 0.024$, social-source is $-0.750 \pm 0.000$; gap $\Delta = +0.017$ vs combined $\sigma = 0.024$ --- within noise.
-}
+\includegraphics[width=0.95\columnwidth]{figs/fig3_transfer.pdf}
+\caption{RQ2 sources (200k, 2-agent) and transfer (120k, single-
+agent S15-W3). Source discrete slightly outperforms source social,
+but at transfer time both modes \emph{tie} at $-0.700 \pm 0.087$.}
 \label{fig:transfer}
 \end{figure}
 
-Figure~\ref{fig:transfer} reads the same way as the in-distribution numbers: \textbf{social does not transfer better than discrete}. The two source managers produce indistinguishable target-eval returns, so RQ2 is not supported by the data. Earlier we also ran a harder test, freezing the same modules and retraining the worker on MiniGrid-KeyCorridorS4R3 (keys, doors). Both conditions got 0\% success after 500K steps; the encoder had never seen keys or doors, so the frozen manager could not produce useful goals regardless of how diverse its vocabulary was. The same-family widened-corridor transfer is the fairer test, and both conditions fail it too: at 60k fine-tune steps, neither source manager recovers positive return on the wider map.
+We freeze the encoder, manager, and communication channel from the
+trained social and discrete models, and fine-tune only the worker +
+goal projection on \texttt{SingleAgentCorridor-S15-W3-v0} for 120k
+steps. This is a same-family transfer test: the target shares
+geometry, observation channels, and action space with the source.
 
-\subsection{H4: Bottleneck capacity sweep}
-\label{sec:h4}
+\textbf{Key finding:} transfer returns are identical across modes
+at $-0.700 \pm 0.087$, with per-seed distributions
+\{$-0.65, -0.65, -0.80$\} for both social and discrete. The social
+channel does not produce a more reusable goal representation than
+the discrete codebook on this target.
 
-We swept the categorical bottleneck across $K \in \{3, 10, 25\}$ tokens per position and $L \in \{1, 3\}$ positions (effective capacity $K^L$), two seeds per cell, 60k steps per run, discrete and social.
+\textbf{A partner-message replay fix is necessary for this test to
+be meaningful for social.} A frozen social manager expects a
+partner-message input. If fed $\mathbf{0}$ at transfer time, it
+operates off-distribution and its output degrades to near-constant,
+so any ``social transfer failure'' is really an input distribution
+shift. We save a 100-sample bank of real partner messages into the
+source checkpoint (captured during the source-training final eval),
+and sample from this bank at transfer. With this fix, social
+transfer is well-defined; without it, social transfer is trivially
+broken regardless of what the manager encodes.
 
-\begin{figure}[h]
+Neither mode achieves goal success (0\%): the S15-W3 corridor is
+materially harder than the 9-wide source, and 120k steps of
+worker-only fine-tuning under a frozen 16-dim goal abstraction is
+not enough to navigate reliably. The return gap (rather than
+success rate) is the signal.
+
+\subsection{RQ3 --- Bottleneck capacity: compositionality vs.\ breadth}
+
+\begin{figure*}[t]
 \centering
-\includegraphics[width=0.98\columnwidth]{figs/fig2_vocab_sweep.pdf}
-\caption{\textbf{Vocab sweep: goal-space coverage vs.\ bottleneck capacity} ($K \cdot L$, log scale).
-Discrete saturates coverage at every capacity; social swings between $0.27$ and $0.70$ and never closes the gap.
-}
-\label{fig:vocab-sweep}
-\end{figure}
+\includegraphics[width=\textwidth]{figs/fig2_vocab.pdf}
+\caption{RQ3 vocab sweep at 60k, \texttt{bus\_strict}, 3 seeds.
+(a) Joint coverage grows with capacity and plateaus beyond
+$K{\times}L=10$. (b) Channel utility (scramble-$\Delta$) is clearly
+positive only at $K{\times}L=9$ (compositional $K{=}3, L{=}3$).}
+\label{fig:vocab}
+\end{figure*}
 
-The discrete bottleneck saturates goal-space coverage at every capacity we tested: $K{\cdot}L \in \{3, 9, 10, 30, 75\}$ all hit $1.00$. Social mode never closes the gap; coverage swings between $0.27$ and $0.70$ depending on $K$ and $L$, with no monotone trend in either direction. So the discrete-vs-social gap is not a vocabulary-size artifact --- it persists across nearly two orders of magnitude of bottleneck capacity --- and there is no $K{\cdot}L$ ``sweet spot'' that recovers full coverage under coordination pressure.
+Figure~\ref{fig:vocab}(b) shows a non-monotone response to bottleneck
+capacity. The only cell where the channel is clearly load-bearing
+across seeds is $K{=}3, L{=}3$ ($\Delta = +0.084 \pm 0.075$).
+The very-tight $K{=}3, L{=}1$ cell is negative: 3 total messages are
+not enough to encode useful partner-goal distinctions. Cells with
+higher raw capacity but shorter messages ($K{=}10, L{=}1$;
+$K{=}10, L{=}3$) are also negative --- the channel decodes but the
+identity of the message does not matter for the policy.
+$K{=}25, L{=}3$ is small-positive but high-variance.
 
-\subsection{RQ4: Coordination scenarios}
-\label{sec:rq4}
+The reading: \textbf{compositional length matters more than raw
+vocabulary breadth}. A small vocabulary over a length-3 message
+produces a usable channel; a large vocabulary over a length-1
+message does not, despite having the same or greater raw capacity.
 
-The corridor is a weak coordination probe (flat PPO already solves it). To stress the message channel, we defined four scenarios: \textit{baseline} (no forced coordination), \textit{bus} (both agents must pass through one shared cell), \textit{bus\_strict} (as bus, with a tighter timing window), and \textit{turn\_taking} (agents must alternate priority). Runs are short (12k timesteps, 3 seeds per cell) because the sweep covers $4 \times 3 = 12$ mode--scenario combinations.
+Joint coverage (Figure~\ref{fig:vocab}(a)) grows monotonically and
+plateaus near 0.9 by $K{\times}L=75$, consistent with ``more
+capacity produces more codes used.'' Crucially, coverage and
+channel-utility are decoupled: a channel can decode a large
+fraction of the goal space while carrying no causal information.
 
-\begin{figure}[h]
+\subsection{RQ4 --- Which coordination scenario makes the channel useful?}
+
+\begin{figure*}[t]
 \centering
-\includegraphics[width=0.98\columnwidth]{figs/fig4_rq4_scenarios.pdf}
-\caption{\textbf{Goal-space coverage per scenario $\times$ mode} (3 seeds, 12k).
-Discrete saturates in every scenario. Social and LOLA are both compressed, but not in the same way: social is above LOLA on the bus scenarios and below it on turn-taking.
-}
+\includegraphics[width=\textwidth]{figs/fig4_rq4.pdf}
+\caption{RQ4 at 100k, 3 seeds. (a) \texttt{baseline} reaches the
+highest joint coverage (0.954); \texttt{bus\_strict} is second.
+(b) \texttt{bus\_strict} is the only scenario with a clearly
+positive scramble-$\Delta$ ($+0.070 \pm 0.104$): the channel is
+load-bearing only under strict bus pressure.}
 \label{fig:rq4}
-\end{figure}
+\end{figure*}
 
-Figure~\ref{fig:rq4} replicates the main H2 pattern across all four scenarios: \textbf{discrete saturates coverage at $1.00$ uniformly}, while social and LOLA sit in the $0.47$--$0.75$ range. Neither stressor destabilises the discrete channel. For the two-agent methods the ordering is less tidy: social coverage is highest on the \textit{bus} scenario ($0.75 \pm 0.05$) and lowest on \textit{turn\_taking} ($0.47 \pm 0.12$), whereas LOLA shows the opposite ranking (bus $0.52 \pm 0.08$, turn\_taking $0.71 \pm 0.10$). This is consistent with our interpretation that the two-agent channel adapts to local coordination demand rather than converging on a universal compressed code, but the effect sizes are comparable to the $\sim\!0.10$ cross-seed std so we do not treat the scenario ordering as a firm claim. The headline --- discrete is immune to the stressors, two-agent variants compress regardless of which stressor --- is robust.
+Across four scenarios (Figure~\ref{fig:rq4}), coverage and utility
+tell different stories. \texttt{Baseline} social reaches the
+highest joint coverage (0.954), but its scramble-$\Delta$ is
+indistinguishable from zero ($+0.024 \pm 0.158$): the agents decode
+a diverse codebook but the decoded message does not affect outcomes.
+\texttt{bus\_strict} is the only scenario with a reliably positive
+scramble-$\Delta$ ($+0.070 \pm 0.104$). \texttt{Turn\_taking}
+removes the \emph{need} to coordinate (sequential arrival is
+enforced exogenously), so its channel is inert by construction.
+Plain \texttt{bus} without the synchronization window is
+indistinguishable from \texttt{baseline} on channel utility.
+
+The policy takeaway: \emph{strict} bus pressure --- last-message
+bus plus a requirement to synchronize arrival within 4 steps --- is
+what makes the channel carry causal partner information. Coverage
+and channel utility are distinct properties, and on this task they
+do not co-vary across scenarios.
+
+\subsection{Cross-RQ summary}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{figs/fig5_scramble.pdf}
+\caption{Scramble-$\Delta$ for social across all experimental cells.
+Green = positive (channel carries causal info); grey = non-positive
+(scrambling is as good or better than real messages). Four of ten
+cells reliably cross zero: $K{\times}L{=}9$, $K{\times}L{=}75$,
+\texttt{bus}, and \texttt{bus\_strict}. The rest straddle zero or
+go negative.}
+\label{fig:scramble}
+\end{figure*}
+
+Figure~\ref{fig:scramble} collects every social scramble-$\Delta$
+in one view. The partner-message channel is reliably load-bearing
+in 4 of 10 configurations; the other 6 are inert or
+counterproductive. Where the channel is useful it is narrowly so ---
+under a specific compositional capacity ($K{=}3, L{=}3$) or under
+strict coordination pressure (\texttt{bus\_strict}). Generic
+social exposure is not enough.
 
 \section{Discussion}
 \label{sec:discussion}
 
-\paragraph{The discrete bottleneck works.} Routing goals through a Gumbel-Softmax codebook prevents collapse by construction. In the no-stress 1M setting it reaches 97.5\% of maximum entropy at zero task-performance cost; in the stress setting it saturates the 16-bin partition of goal space ($1.000 \pm 0.000$) while the continuous TD3 manager covers less than half ($0.485 \pm 0.187$). Across the vocab sweep (Figure~\ref{fig:vocab-sweep}) the discrete channel saturates coverage at every $K{\cdot}L$ we tested. This is the clearest positive result in the paper.
+\paragraph{What holds.} The discrete bottleneck reliably prevents
+goal collapse. The scramble ablation and joint-goal coverage
+together make it possible to distinguish a decoded-but-inert channel
+from a causally-load-bearing one, and this distinction is where the
+interesting scenario-level structure shows up. \texttt{bus\_strict}
+is the one scenario in which the channel is consistently
+load-bearing at our budget.
 
-\paragraph{Adding a partner does not help.} Across both waves, every coordination-aware variant we tried (vanilla social, LOLA) reduces both coverage and per-message information content relative to the discrete-solo baseline. The information drop is large: $I(\text{goal}; \text{msg})$ falls from $1.58$ nats (discrete) to $0.31$ (social) and $0.33$ (LOLA), and a held-out ridge listener recovers the goal direction with $R^2 = 0.25$ from a discrete message but only $0.05$ from a social one. The RQ4 scenario sweep (Figure~\ref{fig:rq4}) confirms this across four coordination regimes: discrete saturates coverage at $1.00$ in every scenario while social and LOLA stay in the $0.47$--$0.75$ compressed range. The transfer experiment (Figure~\ref{fig:transfer}) is also consistent: social and discrete source managers produce indistinguishable target-eval returns.
+\paragraph{What does not.} The hoped-for effect --- that a
+communicating partner produces a more reusable goal abstraction than
+a solo discrete agent --- does not appear on same-family single-
+agent transfer: discrete and social tie at $-0.70$. On the default
+RQ1 setup, social's scramble-$\Delta$ is noisy with one strongly
+negative seed. On RQ4, the scenario that maximizes diversity
+(\texttt{baseline}) is not the scenario that maximizes channel
+utility (\texttt{bus\_strict}).
 
-A reasonable interpretation, supported by Chaabouni et al.~\citeyearpar{chaabouni2020compositionality} on emergent communication, is that coordination pressure rewards \emph{message reuse}, not \emph{message diversity}. Two agents who must understand each other converge on a smaller working vocabulary; this is the opposite of what we hoped social play would do for goal regularisation.
+\paragraph{Interpretation.} The motivating question --- does social
+interaction act as a useful regularizer for hierarchical RL?
+--- gets a conditional answer. Yes when the scenario is forced to
+make the partner channel the only coordination route, and when the
+bottleneck is shaped to reward compositional structure
+($K{=}3, L{=}3$). No in the generic case: on this family of tasks,
+a solo discrete bottleneck achieves the same collapse-prevention
+and the same single-agent transfer quality without the overhead of
+a second agent.
 
-\paragraph{The environment limits the strongest claim we can make.} Flat PPO gets 99.3\% on the no-stress corridor, leaving no head-room for HRL to demonstrate a task-performance advantage. Under the stress configuration there \emph{is} head-room (flat scores $0.67$ eval success and HRL scores $0$), but the stress-config budget (100k steps for single-agent modes, 250k for social/LOLA) is plainly under-trained for HRL to recover the worker policy. The results we report are therefore about goal-space \emph{statistics}, not about whether better statistics yield better task performance --- bridging that gap is the obvious next experiment.
+\paragraph{Environment limitation.} Flat PPO reaches $-0.68$ on
+return, higher than every HRL condition. A corridor navigable by a
+scripted wall-follower does not exercise the manager-worker
+hierarchy, so the diversity and channel-utility numbers are
+substantive but not reflected in return. This is the principal
+reason the positive regimes we find stay narrow: on a task that
+does not require hierarchy, a useful channel cannot turn into
+better task reward.
 
-\section{Limitations and future work}
+\section{Next steps}
 
 \begin{enumerate}[nosep]
-    \item \textbf{Task-performance gap.} The strongest negative result we report (no-task-perf benefit from social play) is observed at the stress-config budget (100k for single-agent modes, 250k for social/LOLA), where no HRL variant solves the stress corridor at all. A 1M-step stress sweep --- which we did not have compute for --- would let us test whether the goal-diversity advantage translates into a task-performance advantage once the worker has time to converge.
-    \item \textbf{Environment.} Flat PPO trivially solves the no-stress corridor and is the only condition that scores at all on the stress corridor in our budget. Replacing it with a multi-room layout that has locked doors, longer horizons, or partial observability would put HRL on more even footing.
-    \item \textbf{Compositionality.} Topographic similarity is essentially zero in every condition; the discrete channel carries information without structure. Adding a structural prior (e.g.\ encouraging similar goals to map to similar messages) is a natural follow-up that does not require changing any of the existing architecture.
-    \item \textbf{Coordination scenarios.} The 12k-step RQ4 sweep (Figure~\ref{fig:rq4}) is underpowered: per-seed standard deviations on coverage are $\sim\!0.10$, comparable to the gap between scenarios. A longer sweep (60k+ timesteps per cell) would let us state firmly whether social and LOLA rank bus/turn\_taking differently or whether that's noise.
+\item \textbf{A harder target.} Move the RQ2 transfer target to a
+task where a discrete manager cannot trivially memorize goal
+positions --- e.g.\ procedurally generated multi-room MiniGrid
+with locked doors --- and run both source and target at
+$\geq 500$k steps.
+\item \textbf{Ablate the synchronization window.}
+\texttt{bus\_strict} ($w{=}4$) is the only reliable regularizer;
+\texttt{bus} ($w{=}0$) and \texttt{baseline} are not. Sweep
+$w \in \{1, 2, 4, 8, 16\}$ to find the minimum coordination
+pressure that produces a load-bearing channel.
+\item \textbf{Isolate compositional length.} Sweep $L \in
+\{1, 2, 3, 4\}$ at fixed $K=3$ to confirm that message length
+(compositional pressure) drives scramble-$\Delta$, not raw
+capacity.
 \end{enumerate}
-
-\appendix
-\section{Sanity checks}
-\label{app:sanity}
-\begin{figure}[h]
-\centering
-\includegraphics[width=0.98\columnwidth]{figs/fig6_sanity.pdf}
-\caption{\textbf{Training sanity checks}: Gumbel-Softmax temperature anneal schedule (target floor $\tau = 0.3$, reached at step 83{,}200 for 100k-step runs and step 204{,}800 for 250k-step runs) and channel reconstruction MSE over training, 3 seeds per mode. The discrete reconstruction loss drops below $5{\times}10^{-3}$ within 20k steps and reaches ${\sim}4{\times}10^{-4}$ by the end of training, while social and LOLA plateau near $0.05$ (two orders of magnitude higher), consistent with the lower $I(\text{goal}; \text{msg})$ of the two-agent channels.
-}
-\label{fig:sanity}
-\end{figure}
 
 \section{Difficulties}
 
-The hardest part was finding the right environment. We wanted something with a natural hierarchical structure (rooms, corridors) and room for two agents to interact. The corridor has both, but it turned out to be too easy for flat PPO. By the time we discovered this we had already run our first wave of experiments on it. A multi-room environment with locked doors (like MiniGrid-KeyCorridorS4R3) would be better, but does not have a natural two-agent variant.
+\paragraph{Out-of-distribution input at ablation time.}
+Comm-ablations that feed a placeholder vector (such as $\mathbf{0}$)
+to a frozen manager conflate ``the channel carries no information''
+with ``the manager is being fed an input it never saw during
+training.'' We observed this first as a nominally broken transfer
+pipeline; swapping in a random real message (scramble ablation,
+and partner-message replay at transfer time) restored the
+pipeline and revealed the actual, much more measured effect. We
+recommend this substitution as a default for any analysis of a
+frozen communicating agent.
 
-Getting the communication channel to work took several iterations. The sender and decoder need their own optimizer --- if they share one with the rest of the network, their gradients interfere with the encoder and worker updates. They also need a reconstruction loss; without it, no gradient reaches the sender or decoder at all, and the channel just outputs random tokens. We only caught this after running our first batch of experiments and noticing that goal entropy was much lower than expected.
+\paragraph{Coverage vs.\ utility.} Pooled coverage confounds
+``diverse code used'' with ``diverse code that matters.''
+$K{\times}L{=}75$ and the \texttt{baseline} scenario both maximize
+coverage while the channel carries essentially no causal
+information. Joint coverage fixes the aggregation but does not by
+itself distinguish decoded-but-inert from causally-useful; only the
+scramble test does.
 
-Making the comparison between discrete and social fair required a single-agent wrapper around the two-agent corridor. Without it, the two conditions would be on different environments (a standard MiniGrid task vs.\ our custom corridor), and any difference in goal metrics could just reflect the different tasks rather than the effect of social pressure.
-
-Reproducibility took non-trivial work in the second wave. We initially saw 10\%-scale run-to-run variance in goal-coverage at the same seed; the cause turned out to be MADDPG's replay-buffer sampling using the global Python RNG (which drifts between processes) rather than a seeded local one. We also found a silent failure path where \texttt{topographic\_similarity} was returning $0.0$ on every run because \texttt{scipy} was not installed in the sweep environment and a bare \texttt{except ImportError} swallowed the missing dependency. Both are fixed; with these in place the 100k stress sweep is bit-reproducible across seeds.
+\paragraph{Parallelism on BSD.} The sweep runs 78 independent
+CPU-bound training jobs across 8 worker slots. BSD \texttt{xargs} on
+macOS does not support \texttt{-d '\textbackslash n'}, so we wrote
+a small pure-bash orchestrator with explicit worker-slot polling
+(\texttt{jobs -rp | wc -l}). Phase 1 (72 jobs) finished in 1h23m;
+phase 2 (6 transfers) in 90s.
 
 \vspace{0.5em}
-\noindent\textbf{Code:} \url{https://github.com/smirnovlad/social-hrl/tree/main}
+\noindent\textbf{Code \& data:}
+\url{https://github.com/smirnovlad/social-hrl}
 
 {\small
 \bibliographystyle{plainnat}
