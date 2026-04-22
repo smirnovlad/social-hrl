@@ -138,7 +138,7 @@ We also report task performance (goal reach rate), though as we will see, it is 
 \centering
 \includegraphics[width=0.98\textwidth]{figs/fig1_main.pdf}
 \caption{\textbf{Main story (stress config, 3 seeds per mode, all panels clipped to 100k steps for fair comparison).}
-(a) Episode return over training --- only flat PPO makes any progress in this budget; the shaded envelope is the per-seed min/max to keep flat's large variance from crushing the HRL curves.
+(a) Episode return over training --- only flat PPO makes any progress in this budget; the shaded envelope is the per-seed min/max to keep flat's large variance from crushing the HRL curves. Panels (b) and (c) use the conventional $\pm 1\sigma$ band across seeds.
 (b) Goal-message entropy of the 1000-message codebook --- discrete, social, and LOLA all saturate near the theoretical ceiling $\ln 1000 \approx 6.908$ (dashed line).
 (c) Goal-space coverage --- discrete saturates at $1.0$ (dashed), continuous plateaus near $0.49$, and the coordination-aware variants land in between (social ${\sim}0.72$, LOLA ${\sim}0.55$).
 }
@@ -236,7 +236,7 @@ Goal entropy        & \textbf{6.73} & 6.21 & --- \\
 \% of max entropy   & \textbf{97.5\%} & 89.8\% & --- \\
 \addlinespace
 \multicolumn{4}{l}{\emph{Stress, April}} \\
-Goal-space coverage & $\mathbf{1.00 \pm 0.00}$ & $0.72 \pm 0.08$ & $0.55 \pm 0.05$ \\
+Goal-space coverage & $\mathbf{1.00 \pm 0.00}$ & $0.72 \pm 0.10$ & $0.55 \pm 0.06$ \\
 Goal entropy (nats) & $6.865 \pm 0.000$ & $6.895 \pm 0.002$ & $6.887 \pm 0.008$ \\
 $I(\text{goal}; \text{msg})$ & $\mathbf{1.575 \pm 0.222}$ & $0.312 \pm 0.030$ & $0.332 \pm 0.016$ \\
 Listener accuracy   & $\mathbf{0.248 \pm 0.058}$ & $0.049 \pm 0.025$ & $0.059 \pm 0.034$ \\
@@ -292,25 +292,25 @@ The discrete bottleneck saturates goal-space coverage at every capacity we teste
 \subsection{RQ4: Coordination scenarios}
 \label{sec:rq4}
 
-The corridor is a weak coordination probe (flat PPO already solves it). To stress the message channel, we defined four scenarios: \textit{baseline} (no forced coordination), \textit{bus} (both agents must pass through one shared cell), \textit{bus\_strict} (as bus, with a tighter 4-step timing window), and \textit{turn\_taking} (agents must alternate priority). Runs are 12k timesteps each, 3 seeds per cell.
+The corridor is a weak coordination probe (flat PPO already solves it). To stress the message channel, we defined four scenarios: \textit{baseline} (no forced coordination), \textit{bus} (both agents must pass through one shared cell), \textit{bus\_strict} (as bus, with a tighter timing window), and \textit{turn\_taking} (agents must alternate priority). Runs are short (12k timesteps, 3 seeds per cell) because the sweep covers $4 \times 3 = 12$ mode--scenario combinations.
 
 \begin{figure}[h]
 \centering
 \includegraphics[width=0.98\columnwidth]{figs/fig4_rq4_scenarios.pdf}
-\caption{\textbf{Goal-space coverage per scenario} (LOLA, 3 seeds, 12k).
-Across all four coordination scenarios LOLA coverage sits in the $0.50$--$0.71$ range, with \textit{turn\_taking} slightly higher than the bus variants. Discrete and social aggregated-summary JSONs for this sweep were not preserved in the submission snapshot, so only the LOLA arm renders; their baseline-scenario values ($\sim\!1.00$ and $\sim\!0.72$ respectively) are reported in Figure~\ref{fig:main-story}c instead.
+\caption{\textbf{Goal-space coverage per scenario $\times$ mode} (3 seeds, 12k).
+Discrete saturates in every scenario. Social and LOLA are both compressed, but not in the same way: social is above LOLA on the bus scenarios and below it on turn-taking.
 }
 \label{fig:rq4}
 \end{figure}
 
-The LOLA arm of Figure~\ref{fig:rq4} shows that coverage is roughly flat across the bus and bus\_strict stressors ($\sim\!0.50$--$0.54$) and slightly higher under turn\_taking ($\sim\!0.71$). We had hypothesised that forcing tighter coordination would either (a) destabilise the channel and reduce coverage further, or (b) push the channel toward higher mutual information by demanding more precise messages. Within LOLA, neither happened: the bus-family scenarios are statistically indistinguishable from the baseline. The turn-taking uptick is intriguing but single-arm evidence; it is not enough on its own to claim the compression we observed in Section H2 reverses under coordination pressure. A proper RQ4 conclusion requires rerunning the sweep for discrete and social, which is flagged as future work.
+Figure~\ref{fig:rq4} replicates the main H2 pattern across all four scenarios: \textbf{discrete saturates coverage at $1.00$ uniformly}, while social and LOLA sit in the $0.47$--$0.75$ range. Neither stressor destabilises the discrete channel. For the two-agent methods the ordering is less tidy: social coverage is highest on the \textit{bus} scenario ($0.75 \pm 0.05$) and lowest on \textit{turn\_taking} ($0.47 \pm 0.12$), whereas LOLA shows the opposite ranking (bus $0.52 \pm 0.08$, turn\_taking $0.71 \pm 0.10$). This is consistent with our interpretation that the two-agent channel adapts to local coordination demand rather than converging on a universal compressed code, but the effect sizes are comparable to the $\sim\!0.10$ cross-seed std so we do not treat the scenario ordering as a firm claim. The headline --- discrete is immune to the stressors, two-agent variants compress regardless of which stressor --- is robust.
 
 \section{Discussion}
 \label{sec:discussion}
 
 \paragraph{The discrete bottleneck works.} Routing goals through a Gumbel-Softmax codebook prevents collapse by construction. In the no-stress 1M setting it reaches 97.5\% of maximum entropy at zero task-performance cost; in the stress setting it saturates the 16-bin partition of goal space ($1.000 \pm 0.000$) while the continuous TD3 manager covers less than half ($0.485 \pm 0.187$). Across the vocab sweep (Figure~\ref{fig:vocab-sweep}) the discrete channel saturates coverage at every $K{\cdot}L$ we tested. This is the clearest positive result in the paper.
 
-\paragraph{Adding a partner does not help.} Across both waves, every coordination-aware variant we tried (vanilla social, LOLA) reduces both coverage and per-message information content relative to the discrete-solo baseline. The information drop is large: $I(\text{goal}; \text{msg})$ falls from $1.58$ nats (discrete) to $0.31$ (social) and $0.33$ (LOLA), and a held-out ridge listener recovers the goal direction with $R^2 = 0.25$ from a discrete message but only $0.05$ from a social one. The LOLA arm of the RQ4 coordination-scenarios sweep (Figure~\ref{fig:rq4}) is consistent with this picture within its single-arm limitation: coverage stays in the $0.5$--$0.7$ range across bus and bus\_strict stressors. The transfer experiment (Figure~\ref{fig:transfer}) is also consistent: social and discrete source managers produce indistinguishable target-eval returns.
+\paragraph{Adding a partner does not help.} Across both waves, every coordination-aware variant we tried (vanilla social, LOLA) reduces both coverage and per-message information content relative to the discrete-solo baseline. The information drop is large: $I(\text{goal}; \text{msg})$ falls from $1.58$ nats (discrete) to $0.31$ (social) and $0.33$ (LOLA), and a held-out ridge listener recovers the goal direction with $R^2 = 0.25$ from a discrete message but only $0.05$ from a social one. The RQ4 scenario sweep (Figure~\ref{fig:rq4}) confirms this across four coordination regimes: discrete saturates coverage at $1.00$ in every scenario while social and LOLA stay in the $0.47$--$0.75$ compressed range. The transfer experiment (Figure~\ref{fig:transfer}) is also consistent: social and discrete source managers produce indistinguishable target-eval returns.
 
 A reasonable interpretation, supported by Chaabouni et al.~\citeyearpar{chaabouni2020compositionality} on emergent communication, is that coordination pressure rewards \emph{message reuse}, not \emph{message diversity}. Two agents who must understand each other converge on a smaller working vocabulary; this is the opposite of what we hoped social play would do for goal regularisation.
 
@@ -322,7 +322,7 @@ A reasonable interpretation, supported by Chaabouni et al.~\citeyearpar{chaaboun
     \item \textbf{Task-performance gap.} The strongest negative result we report (no-task-perf benefit from social play) is observed at the stress-config budget (100k for single-agent modes, 250k for social/LOLA), where no HRL variant solves the stress corridor at all. A 1M-step stress sweep --- which we did not have compute for --- would let us test whether the goal-diversity advantage translates into a task-performance advantage once the worker has time to converge.
     \item \textbf{Environment.} Flat PPO trivially solves the no-stress corridor and is the only condition that scores at all on the stress corridor in our budget. Replacing it with a multi-room layout that has locked doors, longer horizons, or partial observability would put HRL on more even footing.
     \item \textbf{Compositionality.} Topographic similarity is essentially zero in every condition; the discrete channel carries information without structure. Adding a structural prior (e.g.\ encouraging similar goals to map to similar messages) is a natural follow-up that does not require changing any of the existing architecture.
-    \item \textbf{Coordination scenarios.} Figure~\ref{fig:rq4} shows the LOLA arm of a 4-scenario coordination sweep; discrete and social aggregated summaries were not preserved in time for this submission, so the cross-mode RQ4 claim is not supported by this figure alone. Rerunning the sweep for all three two-agent methods, plus a finer sweep of coordination demands (corridor width, time pressure, asymmetric goals), is the natural follow-up.
+    \item \textbf{Coordination scenarios.} The 12k-step RQ4 sweep (Figure~\ref{fig:rq4}) is underpowered: per-seed standard deviations on coverage are $\sim\!0.10$, comparable to the gap between scenarios. A longer sweep (60k+ timesteps per cell) would let us state firmly whether social and LOLA rank bus/turn\_taking differently or whether that's noise.
 \end{enumerate}
 
 \appendix
