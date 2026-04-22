@@ -66,7 +66,7 @@ def _init_matplotlib():
 def _fetch_runs(group: str | None = None, tags: Iterable[str] | None = None):
     """Return a list of wandb.Run objects matching filters."""
     import wandb
-    api = wandb.Api(timeout=30)
+    api = wandb.Api(timeout=120)
     filters = {}
     if group:
         filters['group'] = group
@@ -76,12 +76,31 @@ def _fetch_runs(group: str | None = None, tags: Iterable[str] | None = None):
     return list(runs)
 
 
-def _history_for_run(run, keys: Iterable[str], samples: int = 500):
+def _history_for_run(run, keys: Iterable[str], samples: int = 200,
+                     retries: int = 2):
     """Fetch history (time-series) for given keys from a wandb run.
 
     Returns dict: key -> (steps_array, values_array), with NaNs filtered.
+    Retries on transient network failures with progress logging.
     """
-    df = run.history(keys=list(keys), samples=samples, pandas=True)
+    import time as _t
+    df = None
+    name = getattr(run, 'name', '?')
+    for attempt in range(retries):
+        t0 = _t.time()
+        try:
+            df = run.history(keys=list(keys), samples=samples, pandas=True)
+            print(f'    [hist] {name} key={keys[0] if keys else "?"} '
+                  f'rows={0 if df is None else len(df)} '
+                  f'in {_t.time()-t0:.1f}s', flush=True)
+            break
+        except Exception as e:
+            print(f'    [hist] {name} key={keys[0] if keys else "?"} '
+                  f'attempt {attempt+1}/{retries} FAILED in '
+                  f'{_t.time()-t0:.1f}s: {e}', flush=True)
+            if attempt == retries - 1:
+                raise
+            _t.sleep(2)
     if df is None or len(df) == 0:
         return {}
     out = {}
@@ -100,7 +119,12 @@ def _history_for_run(run, keys: Iterable[str], samples: int = 500):
 def _group_by_mode(runs):
     by_mode = defaultdict(list)
     for r in runs:
-        mode = r.config.get('mode')
+        mode = r.config.get('mode') if isinstance(r.config, dict) else None
+        if not mode:
+            name = getattr(r, 'name', '') or ''
+            head = name.split('-', 1)[0]
+            if head in MODE_COLORS:
+                mode = head
         if mode:
             by_mode[mode].append(r)
     return dict(by_mode)
@@ -187,7 +211,12 @@ def fig2_vocab_sweep(vocab_group: str | None = None,
                 rows.append({'K': K, 'L': L, 'mode': mode, 'coverage': float(cov)})
     if not rows and json_path and os.path.exists(json_path):
         with open(json_path) as f:
-            rows = json.load(f)
+            raw = json.load(f)
+        for r in raw:
+            cov = r.get('goal_space_coverage', r.get('coverage'))
+            if r.get('K') and r.get('L') and r.get('mode') and cov is not None:
+                rows.append({'K': r['K'], 'L': r['L'], 'mode': r['mode'],
+                             'coverage': float(cov)})
     if not rows:
         print('[fig2] no data')
         return
@@ -223,10 +252,13 @@ def fig3_transfer(json_path: str):
         return
     with open(json_path) as f:
         d = json.load(f)
-    sources = []
-    means = []
-    stds = []
-    for src, stats in d.items():
+    agg = d.get('aggregate', d) if isinstance(d, dict) else {}
+    sources: list[str] = []
+    means: list[float] = []
+    stds: list[float] = []
+    for src, stats in agg.items():
+        if not isinstance(stats, dict):
+            continue
         m = stats.get('eval_mean_return')
         if m and m.get('mean') is not None:
             sources.append(src)
@@ -387,7 +419,9 @@ def main():
         try:
             fn(*a, **kw)
         except Exception as e:
+            import traceback
             print(f'[{name}] FAILED: {e}')
+            traceback.print_exc()
 
     if args.mini_sweep_group:
         run('fig1', fig1_main, args.mini_sweep_group)
