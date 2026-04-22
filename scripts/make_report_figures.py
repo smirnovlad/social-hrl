@@ -22,6 +22,7 @@ Idempotent. Re-run anytime after experiments finish.
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import sys
@@ -33,6 +34,7 @@ import numpy as np
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(THIS_DIR)
 FIGS_DIR = os.path.join(ROOT, 'report', 'figs')
+DEFAULT_HISTORY_DIR = os.path.join(ROOT, 'wandb_history')
 os.makedirs(FIGS_DIR, exist_ok=True)
 
 ENTITY = 'mbzuai-research'
@@ -143,6 +145,112 @@ def _interp_stack(xs_list, ys_list, n_points: int = 200):
     return grid, mat
 
 
+def _load_history_dir(history_dir: str) -> dict:
+    """Load all cached wandb-history JSONs under history_dir.
+
+    Expected schema (from scripts/pull_history.py):
+        {"name": ..., "mode": ..., "history": {key: [[step, val], ...]}}
+
+    Returns: {mode: [{key: (steps, vals)}, ...]} --- one dict per run.
+    """
+    out = defaultdict(list)
+    for p in sorted(glob.glob(os.path.join(history_dir, '*.json'))):
+        try:
+            with open(p) as f:
+                rec = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        mode = rec.get('mode')
+        hist = rec.get('history') or {}
+        if not mode:
+            continue
+        run_keys = {}
+        for k, pairs in hist.items():
+            if not pairs:
+                continue
+            arr = np.asarray(pairs, dtype=float)
+            if arr.ndim != 2 or arr.shape[0] < 2:
+                continue
+            run_keys[k] = (arr[:, 0], arr[:, 1])
+        if run_keys:
+            out[mode].append(run_keys)
+    return dict(out)
+
+
+def _plot_timeseries_panel_local(ax, by_mode_runs: dict, key: str,
+                                 title: str, ylabel: str,
+                                 x_clip: float | None = None,
+                                 smooth_w: int = 1,
+                                 band: str = 'std',
+                                 band_alpha: float = 0.12,
+                                 ylim: tuple[float, float] | None = None,
+                                 hline: tuple[float, str] | None = None):
+    """Multi-run time-series panel from cached history dicts.
+
+    Args:
+      x_clip:   drop (step, val) pairs with step > x_clip before interp.
+      smooth_w: centred rolling-average window applied to the mean curve
+                (and bands) on the interpolation grid. 1 = no smoothing.
+      band:     'std' for ±1σ, 'minmax' for [min, max] envelope (useful
+                when one mode has much larger variance than the others).
+      ylim:     y-axis limits.
+      hline:    (y, label) reference line.
+    """
+    def _smooth(a: np.ndarray) -> np.ndarray:
+        if smooth_w <= 1 or len(a) < smooth_w:
+            return a
+        pad = smooth_w // 2
+        ap = np.pad(a, (pad, pad), mode='edge')
+        k = np.ones(smooth_w) / smooth_w
+        return np.convolve(ap, k, mode='valid')[:len(a)]
+
+    for mode in MODE_ORDER:
+        runs = by_mode_runs.get(mode, [])
+        series = []
+        for r in runs:
+            if key not in r:
+                continue
+            xs, ys = r[key]
+            if x_clip is not None:
+                m = xs <= x_clip
+                if m.sum() < 2:
+                    continue
+                xs, ys = xs[m], ys[m]
+            series.append((xs, ys))
+        if not series:
+            continue
+        xs_list = [s[0] for s in series]
+        ys_list = [s[1] for s in series]
+        grid, mat = _interp_stack(xs_list, ys_list)
+        if grid is None:
+            continue
+        mean = _smooth(mat.mean(axis=0))
+        if band == 'minmax':
+            lo = _smooth(mat.min(axis=0))
+            hi = _smooth(mat.max(axis=0))
+        else:
+            std = mat.std(axis=0)
+            lo = _smooth(mean - std)
+            hi = _smooth(mean + std)
+        color = MODE_COLORS.get(mode, 'black')
+        ax.plot(grid, mean, label=mode, color=color, linewidth=1.6)
+        ax.fill_between(grid, lo, hi, color=color, alpha=band_alpha,
+                        linewidth=0)
+    if hline is not None:
+        y, lbl = hline
+        ax.axhline(y, color='black', linestyle='--', linewidth=0.8, alpha=0.6)
+        ax.text(ax.get_xlim()[1], y, f' {lbl}', va='center', ha='left',
+                fontsize=7, alpha=0.7)
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+    if x_clip is not None:
+        ax.set_xlim(0, x_clip)
+    ax.set_title(title)
+    ax.set_xlabel('training step')
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.3)
+
+
 def _plot_timeseries_panel(ax, by_mode, key: str, title: str, ylabel: str):
     for mode in MODE_ORDER:
         runs = by_mode.get(mode, [])
@@ -171,9 +279,54 @@ def _plot_timeseries_panel(ax, by_mode, key: str, title: str, ylabel: str):
     ax.grid(True, alpha=0.3)
 
 
-def fig1_main(mini_sweep_group: str):
-    """Main 3-panel story figure: return, goal_msg_entropy, goal_space_coverage."""
+def fig1_main(mini_sweep_group: str | None = None,
+              history_dir: str | None = None):
+    """Main 3-panel story figure: return, goal_msg_entropy, goal_space_coverage.
+
+    If history_dir is given (or DEFAULT_HISTORY_DIR has JSONs), reads the
+    cached time-series produced by scripts/pull_history.py instead of
+    hitting the wandb API.
+    """
     plt = _init_matplotlib()
+    hdir = history_dir or DEFAULT_HISTORY_DIR
+    if os.path.isdir(hdir) and glob.glob(os.path.join(hdir, '*.json')):
+        by_mode_runs = _load_history_dir(hdir)
+        if not by_mode_runs:
+            print(f'[fig1] no usable history JSONs in {hdir}')
+            return
+        X_MAX = 100_000  # the stress-config horizon named in captions
+        MAX_ENTROPY = float(np.log(1000))  # 3*ln(10) ≈ 6.9078
+        fig, axes = plt.subplots(1, 3, figsize=(12, 3.3))
+        _plot_timeseries_panel_local(
+            axes[0], by_mode_runs, 'mean_return',
+            '(a) Episode return', 'mean return',
+            x_clip=X_MAX, smooth_w=5, band='minmax', band_alpha=0.10,
+            ylim=(-1.0, 1.0))
+        _plot_timeseries_panel_local(
+            axes[1], by_mode_runs, 'goal_msg_entropy',
+            '(b) Goal message entropy', 'entropy (nats)',
+            x_clip=X_MAX, smooth_w=3, band_alpha=0.08,
+            ylim=(5.6, 6.95), hline=(MAX_ENTROPY, 'ln(1000)'))
+        _plot_timeseries_panel_local(
+            axes[2], by_mode_runs, 'goal_space_coverage',
+            '(c) Goal-space coverage', 'coverage',
+            x_clip=X_MAX, smooth_w=5, band_alpha=0.10,
+            ylim=(0.25, 1.05), hline=(1.0, 'saturated'))
+        handles, labels = axes[0].get_legend_handles_labels()
+        fig.legend(handles, labels, loc='lower center',
+                   ncol=len(labels), bbox_to_anchor=(0.5, -0.02),
+                   frameon=False, fontsize=8)
+        fig.tight_layout(rect=(0, 0.04, 1, 1))
+        path = os.path.join(FIGS_DIR, 'fig1_main.pdf')
+        fig.savefig(path)
+        plt.close(fig)
+        n = sum(len(v) for v in by_mode_runs.values())
+        print(f'[fig1] wrote {path} from {n} cached runs, '
+              f'modes={sorted(by_mode_runs)}')
+        return
+    if not mini_sweep_group:
+        print('[fig1] no history cache and no --mini-sweep-group; skipping')
+        return
     runs = _fetch_runs(group=mini_sweep_group)
     if not runs:
         print(f'[fig1] no runs in group={mini_sweep_group}')
@@ -351,9 +504,34 @@ def fig5_social_bars(mini_sweep_group: str):
     print(f'[fig5] wrote {path}')
 
 
-def fig6_sanity(mini_sweep_group: str):
-    """Gumbel tau anneal + comm_recon_loss over time."""
+def fig6_sanity(mini_sweep_group: str | None = None,
+                history_dir: str | None = None):
+    """Gumbel tau anneal + comm_recon_loss over time.
+
+    Reads cached history from history_dir when present, otherwise falls
+    back to the wandb API.
+    """
     plt = _init_matplotlib()
+    hdir = history_dir or DEFAULT_HISTORY_DIR
+    if os.path.isdir(hdir) and glob.glob(os.path.join(hdir, '*.json')):
+        by_mode_runs = _load_history_dir(hdir)
+        if not by_mode_runs:
+            print(f'[fig6] no usable history JSONs in {hdir}')
+            return
+        fig, axes = plt.subplots(1, 2, figsize=(9, 3.2))
+        _plot_timeseries_panel_local(axes[0], by_mode_runs, 'gumbel_tau',
+                                     '(a) Gumbel-Softmax τ', 'τ')
+        _plot_timeseries_panel_local(axes[1], by_mode_runs, 'comm_recon_loss',
+                                     '(b) Comm reconstruction loss', 'MSE')
+        axes[0].legend(loc='upper right', ncol=2)
+        path = os.path.join(FIGS_DIR, 'fig6_sanity.pdf')
+        fig.savefig(path)
+        plt.close(fig)
+        print(f'[fig6] wrote {path} from cached history')
+        return
+    if not mini_sweep_group:
+        print('[fig6] no history cache and no --mini-sweep-group; skipping')
+        return
     runs = _fetch_runs(group=mini_sweep_group)
     by_mode = _group_by_mode(runs)
     fig, axes = plt.subplots(1, 2, figsize=(9, 3.2))
@@ -403,6 +581,9 @@ def main():
                     help='path to transfer_multiseed aggregated_summary.json.')
     ap.add_argument('--vocab-json', default=None,
                     help='path to vocab_sweep summary.json.')
+    ap.add_argument('--history-dir', default=None,
+                    help=f'dir of cached wandb history JSONs for fig1/fig6 '
+                         f'(default: {DEFAULT_HISTORY_DIR}).')
     ap.add_argument('--only', default=None,
                     help='comma-separated subset: fig1,fig2,fig3,fig4,fig5,fig6.')
     args = ap.parse_args()
@@ -423,12 +604,21 @@ def main():
             print(f'[{name}] FAILED: {e}')
             traceback.print_exc()
 
-    if args.mini_sweep_group:
-        run('fig1', fig1_main, args.mini_sweep_group)
-        run('fig5', fig5_social_bars, args.mini_sweep_group)
-        run('fig6', fig6_sanity, args.mini_sweep_group)
+    history_dir = args.history_dir or DEFAULT_HISTORY_DIR
+    have_cache = (os.path.isdir(history_dir)
+                  and bool(glob.glob(os.path.join(history_dir, '*.json'))))
+
+    if args.mini_sweep_group or have_cache:
+        run('fig1', fig1_main, args.mini_sweep_group, history_dir)
+        run('fig6', fig6_sanity, args.mini_sweep_group, history_dir)
     else:
-        print('[info] --mini-sweep-group not given; skipping fig1/5/6')
+        print('[info] no --mini-sweep-group and no cached history; '
+              'skipping fig1/6')
+
+    if args.mini_sweep_group:
+        run('fig5', fig5_social_bars, args.mini_sweep_group)
+    else:
+        print('[info] --mini-sweep-group not given; skipping fig5')
 
     run('fig2', fig2_vocab_sweep, args.vocab_group, vocab_json)
     if transfer_json:
