@@ -302,6 +302,7 @@ class MaddpgTrainer:
         log_interval = max(self.total_timesteps // 50, 200)
         last_stats = {}
         t0 = time.time()
+        history = []
         while self.global_step < self.total_timesteps:
             frac = min(1.0, self.global_step / max(1, self.total_timesteps))
             noise_std = noise_std_init + frac * (noise_std_end - noise_std_init)
@@ -342,7 +343,21 @@ class MaddpgTrainer:
                     'episodes': len(returns),
                 }
                 log_data.update(last_stats)
+                history.append(log_data.copy())
                 wandb_run.log(log_data, step=self.global_step)
+            elif self.global_step % log_interval == 0:
+                mean_ret = float(np.mean(returns[-50:])) if returns else 0.0
+                sps = self.global_step / max(1e-6, time.time() - t0)
+                log_data = {
+                    'global_step': self.global_step,
+                    'mean_return': mean_ret,
+                    'sps': sps,
+                    'noise_std': noise_std,
+                    'replay_buffer_size': len(self.buffer),
+                    'episodes': len(returns),
+                }
+                log_data.update(last_stats)
+                history.append(log_data.copy())
 
         eval_result = self.evaluate(num_episodes=self.eval_episodes)
         dt = time.time() - t0
@@ -373,6 +388,7 @@ class MaddpgTrainer:
             'recon_loss_mean': None,
             'temporal_extent_mean': None,
             'comm_ablation_eval': None,
+            'history': history,
         }
 
     def evaluate(self, num_episodes=10):

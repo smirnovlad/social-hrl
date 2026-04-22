@@ -5,6 +5,15 @@ and run. All headline numbers are now aggregated over 3 seeds (42, 7, 123)
 with mean ± std, not single-seed. The single-seed story from the prior
 revision is preserved at the bottom for comparison.
 
+Audit note (2026-04-22): the experiment code was subsequently corrected in
+four places that affect headline interpretation: single-agent discrete PPO
+now optimizes the same sampled goal that is executed through the bottleneck,
+goal-space metrics now log the actual rollout-time decoded goals, message
+"coverage" now means vocabulary coverage rather than unique/total samples,
+and corridor success is tracked from environment success signals rather than
+return thresholds. Treat the numbers below as pre-audit-fix results until the
+main sweeps are rerun on the updated code.
+
 ## What was added in this round
 
 | Item from Suggested Approach | Status | Artifact |

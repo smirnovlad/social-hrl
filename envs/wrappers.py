@@ -22,6 +22,9 @@ class MinigridWrapper(gym.Wrapper):
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
+        info = dict(info)
+        info.setdefault('base_reward', reward)
+        info.setdefault('success', bool(terminated and reward > 0.0))
         return obs['image'], reward, terminated, truncated, info
 
 
@@ -117,6 +120,8 @@ class DistanceShapingWrapper(gym.Wrapper):
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
+        info = dict(info)
+        info.setdefault('base_reward', reward)
         if self._env_kind is not None:
             subgoal = self._current_subgoal()
             if subgoal is not None:
@@ -127,6 +132,7 @@ class DistanceShapingWrapper(gym.Wrapper):
                     reward = reward + self.alpha * (self._prev_dist - curr_dist)
                 self._prev_subgoal = subgoal
                 self._prev_dist = curr_dist
+        info.setdefault('success', bool(terminated and info.get('base_reward', 0.0) > 0.0))
         return obs, reward, terminated, truncated, info
 
 

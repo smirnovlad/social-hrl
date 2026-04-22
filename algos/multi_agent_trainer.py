@@ -70,6 +70,8 @@ class MultiAgentTrainer:
         self.bus_cost_shared = env_cfg.get('bus_cost_shared', 0.0)
         self.bus_window = env_cfg.get('bus_window', 0)
         self.turn_taking = env_cfg.get('turn_taking', False)
+        self.randomize_goals = env_cfg.get('randomize_goals', False)
+        self.mutual_goal_blind = env_cfg.get('mutual_goal_blind', False)
         self.eval_episodes = config['experiment'].get('eval_episodes', 20)
         hidden_dim = config['encoder']['hidden_dim']
         goal_dim = config['manager']['goal_dim']
@@ -90,6 +92,8 @@ class MultiAgentTrainer:
                 bus_cost_shared=self.bus_cost_shared,
                 bus_window=self.bus_window,
                 turn_taking=self.turn_taking,
+                randomize_goals=self.randomize_goals,
+                mutual_goal_blind=self.mutual_goal_blind,
             )
             for i in range(self.num_envs)
         ]
@@ -262,6 +266,7 @@ class MultiAgentTrainer:
 
         messages_log = [[], []]
         states_log = [[], []]
+        decoded_goal_events = [[], []]
 
         current_goal = [
             torch.zeros(N, self.config['manager']['goal_dim']).to(self.device),
@@ -322,6 +327,9 @@ class MultiAgentTrainer:
 
                     messages_log[a].append(msg_indices[needs_new_goal].cpu().numpy())
                     states_log[a].append(features[a][needs_new_goal].detach().cpu().numpy())
+                    decoded_goal_events[a].append(
+                        decoded_goal[needs_new_goal].detach().cpu().numpy()
+                    )
 
                     # Manager PPO data
                     # Use shared critic for value
@@ -492,8 +500,22 @@ class MultiAgentTrainer:
                     float(_temporal_extent(goal_seq[:, i, :], threshold=0.01))
                 )
 
-        return (worker_rollouts, manager_rollouts, messages_log, states_log,
-                episode_returns, per_env_extents)
+        per_agent_goals = []
+        for a in range(2):
+            if decoded_goal_events[a]:
+                per_agent_goals.append(np.concatenate(decoded_goal_events[a], axis=0))
+            else:
+                per_agent_goals.append(None)
+
+        return (
+            worker_rollouts,
+            manager_rollouts,
+            messages_log,
+            states_log,
+            per_agent_goals,
+            episode_returns,
+            per_env_extents,
+        )
 
     def update(self, worker_rollouts, manager_rollouts):
         all_stats = defaultdict(list)
@@ -584,17 +606,28 @@ class MultiAgentTrainer:
 
         return {k: np.mean(v) for k, v in all_stats.items()}
 
-    def evaluate(self, num_episodes=20, ablate_comm=False):
+    def evaluate(self, num_episodes=20, ablate_comm=False,
+                 ablate_mode='zero'):
         """Evaluate agents with optional communication ablation.
 
         Args:
             num_episodes: Number of episodes to evaluate.
-            ablate_comm: If True, zero out partner messages.
+            ablate_comm: If True, break the partner message channel.
+            ablate_mode: How to break it when ablate_comm is True.
+                'zero': feed a zero vector as partner message (default, legacy).
+                'scramble': feed a random draw from a bank of real partner
+                    messages produced earlier in this eval. Same distribution,
+                    no causal info -- a stronger test of whether the channel
+                    is actually useful vs. just providing regularization noise.
         Returns:
             Dict with mean returns for each agent and combined.
         """
         returns_a, returns_b = [], []
         successes = []
+        # Bank of real partner messages collected across this eval run, used
+        # by ablate_mode='scramble' to feed random-but-in-distribution partner
+        # messages instead of the true ones.
+        msg_bank = [[], []]
 
         for ep in range(num_episodes):
             env = MultiAgentWrapper(
@@ -610,6 +643,8 @@ class MultiAgentTrainer:
                 bus_cost_shared=self.bus_cost_shared,
                 bus_window=self.bus_window,
                 turn_taking=self.turn_taking,
+                randomize_goals=self.randomize_goals,
+                mutual_goal_blind=self.mutual_goal_blind,
             )
             (obs_a, obs_b), _ = env.reset()
             obs = [
@@ -628,6 +663,7 @@ class MultiAgentTrainer:
             ep_reward = [0.0, 0.0]
             step = 0
             done = False
+            success = False
 
             while not done and step < self.max_steps:
                 with torch.no_grad():
@@ -636,20 +672,34 @@ class MultiAgentTrainer:
                     if step % self.goal_period == 0:
                         for a in range(2):
                             partner = 1 - a
-                            if ablate_comm:
+                            if ablate_comm and ablate_mode == 'zero':
                                 p_embed = torch.zeros(
                                     1, self.config['manager']['goal_dim']
                                 ).to(self.device)
+                            elif ablate_comm and ablate_mode == 'scramble':
+                                if msg_bank[partner]:
+                                    import random as _random
+                                    surrogate = _random.choice(msg_bank[partner])
+                                    p_embed = self.comm_channels[partner].embed_message(
+                                        surrogate
+                                    )
+                                else:
+                                    p_embed = torch.zeros(
+                                        1, self.config['manager']['goal_dim']
+                                    ).to(self.device)
                             else:
                                 p_embed = self.comm_channels[partner].embed_message(
                                     partner_msg[partner]
                                 )
-                            g, _, _, _ = self.managers[a](feats[a], received_message=p_embed)
-                            msg_oh, _, _ = self.comm_channels[a].encode(g)
+                            _, _, _, goal_mean = self.managers[a](
+                                feats[a], received_message=p_embed
+                            )
+                            msg_oh, _ = self.comm_channels[a].encode_deterministic(goal_mean)
                             goal[a] = F.normalize(
                                 self.comm_channels[a].decode(msg_oh), dim=-1
                             )
                             partner_msg[a] = msg_oh.detach()
+                            msg_bank[a].append(msg_oh.detach())
 
                     acts = []
                     for a in range(2):
@@ -665,13 +715,21 @@ class MultiAgentTrainer:
                 ]
                 ep_reward[0] += rew_a
                 ep_reward[1] += rew_b
+                success = success or bool(info.get('success', False))
                 done = terminated or truncated
                 step += 1
 
             returns_a.append(ep_reward[0])
             returns_b.append(ep_reward[1])
-            successes.append(float(((ep_reward[0] + ep_reward[1]) / 2.0) > 0.0))
+            successes.append(float(success))
 
+        # Cache the msg_bank so save() can persist a snapshot of real partner
+        # messages into the checkpoint (used at transfer time to avoid feeding
+        # out-of-distribution zeros to the frozen social manager).
+        self._last_msg_bank = [
+            torch.cat(msg_bank[a], dim=0).detach().cpu() if msg_bank[a] else None
+            for a in range(2)
+        ]
         return {
             'mean_return_a': np.mean(returns_a),
             'mean_return_b': np.mean(returns_b),
@@ -689,9 +747,10 @@ class MultiAgentTrainer:
         all_returns = []
         all_messages = []
         all_states = []
-        all_decoded_goals = []
+        all_decoded_goals = [[], []]
         all_temporal_extents = []
         recent_recon_loss = []
+        history = []
 
         print(f"Training mode: social (2 agents)")
         print(f"Total timesteps: {self.total_timesteps}")
@@ -715,8 +774,15 @@ class MultiAgentTrainer:
                 for pg in self.optimizer.param_groups:
                     pg['lr'] = lr
 
-            (worker_rollouts, manager_rollouts, messages_log, states_log_batch,
-             ep_returns, per_env_extents) = self.collect_rollout()
+            (
+                worker_rollouts,
+                manager_rollouts,
+                messages_log,
+                states_log_batch,
+                rollout_decoded_goals,
+                ep_returns,
+                per_env_extents,
+            ) = self.collect_rollout()
             stats = self.update(worker_rollouts, manager_rollouts)
             if per_env_extents:
                 all_temporal_extents.extend(per_env_extents)
@@ -726,19 +792,10 @@ class MultiAgentTrainer:
                     all_messages.extend(messages_log[a])
                 if states_log_batch[a]:
                     all_states.extend(states_log_batch[a])
-                m_data = manager_rollouts[a] if manager_rollouts else None
-                if isinstance(m_data, dict) and 'goals' in m_data:
-                    # Agent-side goals are pre-bottleneck. Decode to see what
-                    # the worker actually consumes (unit-normalized, as used
-                    # everywhere else in the bottleneck path).
-                    with torch.no_grad():
-                        raw = F.normalize(m_data['goals'].detach(), dim=-1)
-                        msg_oh, _, _ = self.comm_channels[a].encode(raw)
-                        decoded = F.normalize(
-                            self.comm_channels[a].decode(msg_oh), dim=-1
-                        ).cpu().numpy()
-                    if decoded.ndim == 2 and len(decoded) > 0:
-                        all_decoded_goals.append(decoded)
+            for a in range(2):
+                ag_goals = rollout_decoded_goals[a] if isinstance(rollout_decoded_goals, list) else None
+                if isinstance(ag_goals, np.ndarray) and ag_goals.ndim == 2:
+                    all_decoded_goals[a].append(ag_goals)
             if 'comm_recon_loss' in stats:
                 recent_recon_loss.append(stats['comm_recon_loss'])
             all_returns.extend(ep_returns)
@@ -771,22 +828,80 @@ class MultiAgentTrainer:
                                 if isinstance(batch, np.ndarray) for m in batch]
                         if len(flat) >= 10:
                             log_data['goal_msg_entropy'] = goal_entropy(flat)
-                            log_data['goal_msg_coverage'] = goal_coverage(flat)
-                    if all_decoded_goals:
-                        goals_cat = np.concatenate(all_decoded_goals, axis=0)
-                        if len(goals_cat) >= 2:
+                            log_data['goal_msg_coverage'] = goal_coverage(
+                                flat,
+                                vocab_size=self.config['communication']['vocab_size'],
+                                message_length=self.config['communication']['message_length'],
+                            )
+                    goals_per_agent = [
+                        np.concatenate(all_decoded_goals[a], axis=0)
+                        if all_decoded_goals[a] else None
+                        for a in range(2)
+                    ]
+                    if goals_per_agent[0] is not None or goals_per_agent[1] is not None:
+                        non_none = [g for g in goals_per_agent if g is not None]
+                        goals_cat = np.concatenate(non_none, axis=0) if non_none else None
+                        if goals_cat is not None and len(goals_cat) >= 2:
                             log_data['goal_space_coverage'] = goal_space_coverage(goals_cat)
                             log_data['goal_vector_std'] = goal_vector_std(goals_cat)
                     if all_temporal_extents:
                         log_data['temporal_extent'] = float(np.mean(all_temporal_extents[-200:]))
                     log_data.update(stats)
+                    history.append({
+                        k: (float(v) if isinstance(v, (int, float, np.floating)) else v)
+                        for k, v in log_data.items()
+                    })
                     wandb_run.log(log_data, step=self.global_step)
+                else:
+                    log_data = {
+                        'global_step': self.global_step,
+                        'mean_return': mean_return,
+                        'sps': sps,
+                        'learning_rate': lr,
+                        'episodes': len(all_returns),
+                        'intrinsic_coef': self._get_intrinsic_coef(),
+                    }
+                    if hasattr(self, 'comm_channels') and self.comm_channels:
+                        log_data['gumbel_tau'] = float(self.comm_channels[0].tau.item())
+                    if all_messages:
+                        flat = [m for batch in all_messages
+                                if isinstance(batch, np.ndarray) for m in batch]
+                        if len(flat) >= 10:
+                            log_data['goal_msg_entropy'] = goal_entropy(flat)
+                            log_data['goal_msg_coverage'] = goal_coverage(
+                                flat,
+                                vocab_size=self.config['communication']['vocab_size'],
+                                message_length=self.config['communication']['message_length'],
+                            )
+                    goals_per_agent = [
+                        np.concatenate(all_decoded_goals[a], axis=0)
+                        if all_decoded_goals[a] else None
+                        for a in range(2)
+                    ]
+                    if goals_per_agent[0] is not None or goals_per_agent[1] is not None:
+                        non_none = [g for g in goals_per_agent if g is not None]
+                        goals_cat = np.concatenate(non_none, axis=0) if non_none else None
+                        if goals_cat is not None and len(goals_cat) >= 2:
+                            log_data['goal_space_coverage'] = goal_space_coverage(goals_cat)
+                            log_data['goal_vector_std'] = goal_vector_std(goals_cat)
+                    if all_temporal_extents:
+                        log_data['temporal_extent'] = float(np.mean(all_temporal_extents[-200:]))
+                    log_data.update(stats)
+                    history.append({
+                        k: (float(v) if isinstance(v, (int, float, np.floating)) else v)
+                        for k, v in log_data.items()
+                    })
 
             if self.global_step > 0 and self.global_step % self.config['experiment']['save_interval'] == 0:
                 self.save(os.path.join(output_dir, f'checkpoint_{self.global_step}.pt'))
 
         self.save(os.path.join(output_dir, 'final.pt'))
         final_eval = self.evaluate(num_episodes=self.eval_episodes, ablate_comm=False)
+        # Re-save so the checkpoint carries the msg_bank snapshot captured
+        # during the final eval. Transfer (RQ2) loads this bank and samples
+        # real partner messages instead of feeding zeros to the frozen
+        # social manager (which is out-of-distribution).
+        self.save(os.path.join(output_dir, 'final.pt'))
         print(
             f"Final eval: return={final_eval['mean_return']:.3f} +/- "
             f"{final_eval['std_return']:.3f} | success={100 * final_eval['success_rate']:.1f}%"
@@ -798,37 +913,60 @@ class MultiAgentTrainer:
             print("\n--- Communication Ablation Evaluation ---")
             eval_with_comm = final_eval
             eval_without_comm = self.evaluate(
-                num_episodes=self.eval_episodes, ablate_comm=True
+                num_episodes=self.eval_episodes, ablate_comm=True,
+                ablate_mode='zero',
             )
-            print(f"  With comm:    return={eval_with_comm['mean_return']:.3f} +/- {eval_with_comm['std_return']:.3f}")
-            print(f"  Without comm: return={eval_without_comm['mean_return']:.3f} +/- {eval_without_comm['std_return']:.3f}")
-            print(f"  Delta: {eval_with_comm['mean_return'] - eval_without_comm['mean_return']:.3f}")
+            # Scramble eval: partner messages drawn from the real msg bank
+            # but un-paired from the current episode. Controls for "zero is
+            # out-of-distribution" -- if the channel is just noise regularizer,
+            # scramble return should match with-comm return; if it carries
+            # causal info, scramble should be worse than with-comm.
+            eval_scrambled = self.evaluate(
+                num_episodes=self.eval_episodes, ablate_comm=True,
+                ablate_mode='scramble',
+            )
+            delta_zero = eval_with_comm['mean_return'] - eval_without_comm['mean_return']
+            delta_scramble = eval_with_comm['mean_return'] - eval_scrambled['mean_return']
+            print(f"  With comm:      return={eval_with_comm['mean_return']:.3f} +/- {eval_with_comm['std_return']:.3f}")
+            print(f"  Zero-msg comm:  return={eval_without_comm['mean_return']:.3f} +/- {eval_without_comm['std_return']:.3f}")
+            print(f"  Scrambled comm: return={eval_scrambled['mean_return']:.3f} +/- {eval_scrambled['std_return']:.3f}")
+            print(f"  Delta (zero):     {delta_zero:+.3f}")
+            print(f"  Delta (scramble): {delta_scramble:+.3f}")
             comm_eval = {
                 'with_comm': eval_with_comm,
                 'without_comm': eval_without_comm,
-                'delta': eval_with_comm['mean_return'] - eval_without_comm['mean_return'],
+                'scrambled': eval_scrambled,
+                'delta': delta_zero,
+                'delta_scramble': delta_scramble,
             }
 
             if wandb_run is not None:
                 wandb_run.summary['eval_with_comm'] = eval_with_comm['mean_return']
                 wandb_run.summary['eval_without_comm'] = eval_without_comm['mean_return']
-                wandb_run.summary['comm_ablation_delta'] = (
-                    eval_with_comm['mean_return'] - eval_without_comm['mean_return']
-                )
+                wandb_run.summary['eval_scrambled'] = eval_scrambled['mean_return']
+                wandb_run.summary['comm_ablation_delta'] = delta_zero
+                wandb_run.summary['comm_ablation_delta_scramble'] = delta_scramble
 
+        goals_per_agent = [
+            np.concatenate(all_decoded_goals[a], axis=0)
+            if all_decoded_goals[a] else None
+            for a in range(2)
+        ]
+        non_none_goals = [g for g in goals_per_agent if g is not None]
         decoded_goals_arr = (
-            np.concatenate(all_decoded_goals, axis=0)
-            if all_decoded_goals else None
+            np.concatenate(non_none_goals, axis=0) if non_none_goals else None
         )
         return {
             'returns': all_returns,
             'messages': all_messages,
             'states': all_states,
             'decoded_goals': decoded_goals_arr,
+            'decoded_goals_per_agent': goals_per_agent,
             'recon_loss_mean': float(np.mean(recent_recon_loss[-50:])) if recent_recon_loss else None,
             'temporal_extent_mean': float(np.mean(all_temporal_extents)) if all_temporal_extents else None,
             'eval': final_eval,
             'comm_ablation_eval': comm_eval,
+            'history': history,
         }
 
     def save(self, path):
@@ -845,6 +983,9 @@ class MultiAgentTrainer:
             'optimizer': self.optimizer.state_dict(),
             'comm_optimizers': [opt.state_dict() for opt in self.comm_optimizers],
         }
+        bank = getattr(self, '_last_msg_bank', None)
+        if bank is not None:
+            state['partner_msg_bank'] = bank
         torch.save(state, path)
         print(f"Saved checkpoint to {path}")
 

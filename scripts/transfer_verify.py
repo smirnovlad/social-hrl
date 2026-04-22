@@ -53,6 +53,10 @@ def run_one(ckpt_path, source_mode, target_size, target_width,
     )
     results = trainer.train()
     elapsed = time.time() - t0
+    np.save(os.path.join(out_dir, 'returns.npy'), np.array(results['returns']))
+    if results.get('history') is not None:
+        with open(os.path.join(out_dir, 'history.json'), 'w') as f:
+            json.dump(results['history'], f, indent=2, default=float)
     metrics = {
         'source_mode': source_mode,
         'source_ckpt': ckpt_path,

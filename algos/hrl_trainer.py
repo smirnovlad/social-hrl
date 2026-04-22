@@ -79,6 +79,7 @@ class HRLTrainer:
         self.corridor_width = env_cfg.get('corridor_width', 3)
         self.corridor_size = env_cfg.get('corridor_size', 11)
         self.eval_episodes = config['experiment'].get('eval_episodes', 20)
+        self.randomize_goals = env_cfg.get('randomize_goals', False)
         if use_corridor:
             from envs.multi_agent_env import make_corridor_vec_env
             self.envs = make_corridor_vec_env(
@@ -87,6 +88,7 @@ class HRLTrainer:
                 max_steps=env_cfg.get('max_steps', 200),
                 corridor_width=self.corridor_width,
                 corridor_size=self.corridor_size,
+                randomize_goals=self.randomize_goals,
             )
         else:
             self.envs = make_vec_env(
@@ -379,7 +381,6 @@ class HRLTrainer:
         # Manager buffers — per-environment
         m_feat_buf = [[] for _ in range(N)]
         m_goal_buf = [[] for _ in range(N)]
-        m_goal_mean_buf = [[] for _ in range(N)]  # For comm channel training
         m_rew_buf = [[] for _ in range(N)]
         m_done_buf = [[] for _ in range(N)]
         # PPO-specific (discrete/option_critic only)
@@ -393,6 +394,7 @@ class HRLTrainer:
 
         messages_log = [] if (self.mode == 'discrete' or self.use_option_critic) else None
         states_log = [] if (self.mode == 'discrete' or self.use_option_critic) else None
+        decoded_goal_events = []
 
         obs = self.obs
         current_goal = torch.zeros(N, self.config['manager']['goal_dim']).to(self.device)
@@ -441,6 +443,9 @@ class HRLTrainer:
                         messages_log.append(msg_indices[needs_new_goal].cpu().numpy())
                     if states_log is not None:
                         states_log.append(features[needs_new_goal].detach().cpu().numpy())
+                    decoded_goal_events.append(
+                        decoded_goal[needs_new_goal].detach().cpu().numpy()
+                    )
 
                     for i in range(N):
                         if needs_new_goal[i]:
@@ -479,14 +484,16 @@ class HRLTrainer:
                             m_rew_buf[i].append(manager_extrinsic_reward[i].item())
                             m_done_buf[i].append(0.0)
                             manager_extrinsic_reward[i] = 0.0
+                    decoded_goal_events.append(
+                        goal[needs_new_goal].detach().cpu().numpy()
+                    )
 
                 elif self.mode == 'discrete':
                     with torch.no_grad():
-                        goal, log_prob, value, goal_mean = self.manager(features)
+                        goal, log_prob, value, _ = self.manager(features)
                     self._anneal_tau()
                     with torch.no_grad():
-                        # Use goal_mean for comm channel (consistent with eval)
-                        msg_onehot, msg_indices, _ = self.comm_channel.encode(goal_mean)
+                        msg_onehot, msg_indices, _ = self.comm_channel.encode(goal)
                         decoded_goal = F.normalize(self.comm_channel.decode(msg_onehot), dim=-1)
                     new_goal = torch.where(
                         needs_new_goal.unsqueeze(-1).expand_as(decoded_goal),
@@ -500,12 +507,14 @@ class HRLTrainer:
                         if needs_new_goal[i]:
                             m_feat_buf[i].append(features[i])
                             m_goal_buf[i].append(goal[i])
-                            m_goal_mean_buf[i].append(goal_mean[i])
                             m_logp_buf[i].append(log_prob[i])
                             m_val_buf[i].append(value[i])
                             m_rew_buf[i].append(manager_extrinsic_reward[i].clone())
                             m_done_buf[i].append(torch.tensor(0.0, device=self.device))
                             manager_extrinsic_reward[i] = 0.0
+                    decoded_goal_events.append(
+                        decoded_goal[needs_new_goal].detach().cpu().numpy()
+                    )
 
                 if not self.use_option_critic:
                     current_goal = new_goal
@@ -621,13 +630,6 @@ class HRLTrainer:
                 if self.use_option_critic:
                     all_m_options.append(torch.stack(m_option_buf[i][:-1]))
 
-            # Collect goal_means for comm channel training
-            all_m_goal_means = []
-            if self.mode == 'discrete':
-                for i in range(N):
-                    if len(m_goal_mean_buf[i]) >= 2:
-                        all_m_goal_means.append(torch.stack(m_goal_mean_buf[i][:-1]))
-
             if all_m_advantages:
                 manager_data = {
                     'features': torch.cat(all_m_features),
@@ -636,8 +638,6 @@ class HRLTrainer:
                     'advantages': torch.cat(all_m_advantages),
                     'returns': torch.cat(all_m_returns),
                 }
-                if all_m_goal_means:
-                    manager_data['goal_means'] = torch.cat(all_m_goal_means)
                 if self.use_option_critic and all_m_options:
                     manager_data['options'] = torch.cat(all_m_options)
 
@@ -663,6 +663,10 @@ class HRLTrainer:
             'manager': manager_data,
             'messages': messages_log,
             'states': states_log,
+            'decoded_goals': (
+                np.concatenate(decoded_goal_events, axis=0)
+                if decoded_goal_events else None
+            ),
             'per_env_temporal_extents': per_env_extents,
         }, episode_returns
 
@@ -775,9 +779,8 @@ class HRLTrainer:
             # bottleneck: otherwise recon_loss + sender_entropy has a trivial
             # minimum at raw_goals -> 0 (encoder logits uniform, decoder outputs
             # zeros), causing silent magnitude collapse in goal space.
-            comm_goals = m_data.get('goal_means', m_data.get('goals'))
-            if m_data and comm_goals is not None:
-                raw_goals = F.normalize(comm_goals.detach(), dim=-1)
+            if m_data and m_data.get('goals') is not None:
+                raw_goals = F.normalize(m_data['goals'].detach(), dim=-1)
                 msg_onehot, _, logits = self.comm_channel.encode(raw_goals)
                 reconstructed = F.normalize(self.comm_channel.decode(msg_onehot), dim=-1)
                 recon_loss = F.mse_loss(reconstructed, raw_goals)
@@ -811,6 +814,7 @@ class HRLTrainer:
                 corridor_length=3,
                 max_steps=self.max_steps or 200,
                 corridor_width=self.corridor_width,
+                randomize_goals=self.randomize_goals,
             )
         return make_env(self.env_name, seed=seed, max_steps=self.max_steps)()
 
@@ -845,6 +849,16 @@ class HRLTrainer:
         msg_onehot, _ = self.comm_channel.encode_deterministic(goal)
         return current_option, F.normalize(self.comm_channel.decode(msg_onehot), dim=-1)
 
+    @staticmethod
+    def _episode_success(info, ep_return):
+        if isinstance(info, dict):
+            if 'success' in info:
+                return bool(info['success'])
+            agent_dones = info.get('agent_dones')
+            if agent_dones is not None and len(agent_dones) > 0:
+                return bool(agent_dones[0])
+        return bool(ep_return > 0.0)
+
     def evaluate(self, num_episodes=20):
         """Evaluate the current policy on the training task."""
         returns = []
@@ -860,6 +874,7 @@ class HRLTrainer:
             steps_since_goal = 0
             done = False
             ep_return = 0.0
+            success = False
 
             while not done:
                 with torch.no_grad():
@@ -885,15 +900,16 @@ class HRLTrainer:
 
                         action = self._select_worker_action(features, current_goal)
 
-                next_obs, reward, terminated, truncated, _ = env.step(action.item())
+                next_obs, reward, terminated, truncated, info = env.step(action.item())
                 done = terminated or truncated
                 ep_return += reward
+                success = success or self._episode_success(info, ep_return)
                 obs_t = torch.from_numpy(next_obs).unsqueeze(0).to(self.device)
                 steps_since_goal += 1
 
             env.close()
             returns.append(ep_return)
-            successes.append(float(ep_return > 0.0))
+            successes.append(float(success))
 
         return {
             'mean_return': float(np.mean(returns)) if returns else 0.0,
@@ -918,6 +934,7 @@ class HRLTrainer:
         all_temporal_extents = []
         recent_recon_loss = []
         recent_mean_beta = []
+        history = []
 
         mode_name = 'option_critic' if self.use_option_critic else self.mode
         if self.use_sac:
@@ -955,14 +972,9 @@ class HRLTrainer:
                     all_messages.extend(rollout['messages'])
                 if rollout.get('states') and rollout['states']:
                     all_states.extend(rollout['states'])
-                # For collapse analysis: retain the realized (post-bottleneck)
-                # goals that the worker actually conditioned on during the
-                # rollout. This is the object whose collapse matters.
-                m_data = rollout.get('manager') or {}
-                if isinstance(m_data, dict) and 'goals' in m_data:
-                    g = m_data['goals'].detach().cpu().numpy()
-                    if g.ndim == 2 and len(g) > 0:
-                        all_decoded_goals.append(g)
+                realized_goals = rollout.get('decoded_goals')
+                if isinstance(realized_goals, np.ndarray) and realized_goals.ndim == 2:
+                    all_decoded_goals.append(realized_goals)
                 if 'comm_recon_loss' in stats:
                     recent_recon_loss.append(stats['comm_recon_loss'])
                 if 'oc_mean_beta' in stats:
@@ -1005,7 +1017,11 @@ class HRLTrainer:
                                 if isinstance(batch, np.ndarray) for m in batch]
                         if len(flat) >= 10:
                             log_data['goal_msg_entropy'] = goal_entropy(flat)
-                            log_data['goal_msg_coverage'] = goal_coverage(flat)
+                            log_data['goal_msg_coverage'] = goal_coverage(
+                                flat,
+                                vocab_size=self.config['communication']['vocab_size'],
+                                message_length=self.config['communication']['message_length'],
+                            )
                     if all_decoded_goals:
                         goals_cat = np.concatenate(all_decoded_goals, axis=0)
                         if len(goals_cat) >= 2:
@@ -1014,7 +1030,44 @@ class HRLTrainer:
                     if all_temporal_extents:
                         log_data['temporal_extent'] = float(np.mean(all_temporal_extents[-200:]))
                     log_data.update(stats)
+                    history.append({
+                        k: (float(v) if isinstance(v, (int, float, np.floating)) else v)
+                        for k, v in log_data.items()
+                    })
                     wandb_run.log(log_data, step=self.global_step)
+                else:
+                    log_data = {
+                        'global_step': self.global_step,
+                        'mean_return': mean_return,
+                        'sps': sps,
+                        'learning_rate': lr,
+                        'episodes': len(all_returns),
+                        'intrinsic_coef': self._get_intrinsic_coef(),
+                    }
+                    if hasattr(self, 'comm_channel') and self.comm_channel is not None:
+                        log_data['gumbel_tau'] = float(self.comm_channel.tau.item())
+                    if all_messages:
+                        flat = [m for batch in all_messages
+                                if isinstance(batch, np.ndarray) for m in batch]
+                        if len(flat) >= 10:
+                            log_data['goal_msg_entropy'] = goal_entropy(flat)
+                            log_data['goal_msg_coverage'] = goal_coverage(
+                                flat,
+                                vocab_size=self.config['communication']['vocab_size'],
+                                message_length=self.config['communication']['message_length'],
+                            )
+                    if all_decoded_goals:
+                        goals_cat = np.concatenate(all_decoded_goals, axis=0)
+                        if len(goals_cat) >= 2:
+                            log_data['goal_space_coverage'] = goal_space_coverage(goals_cat)
+                            log_data['goal_vector_std'] = goal_vector_std(goals_cat)
+                    if all_temporal_extents:
+                        log_data['temporal_extent'] = float(np.mean(all_temporal_extents[-200:]))
+                    log_data.update(stats)
+                    history.append({
+                        k: (float(v) if isinstance(v, (int, float, np.floating)) else v)
+                        for k, v in log_data.items()
+                    })
 
             # Save checkpoint
             if self.global_step > 0 and self.global_step % self.config['experiment']['save_interval'] == 0:
@@ -1041,6 +1094,7 @@ class HRLTrainer:
             'mean_beta': float(np.mean(recent_mean_beta[-50:])) if recent_mean_beta else None,
             'temporal_extent_mean': float(np.mean(all_temporal_extents)) if all_temporal_extents else None,
             'eval': final_eval,
+            'history': history,
         }
 
     # ------------------------------------------------------------------

@@ -26,6 +26,8 @@ MODES = os.environ.get('MODES',
                        'flat continuous discrete social lola maddpg').split()
 TIMESTEPS = int(os.environ.get('TIMESTEPS', '15000'))
 USE_BUS = os.environ.get('USE_BUS', '1') == '1'
+RANDOMIZE_GOALS = os.environ.get('RANDOMIZE_GOALS', '0') == '1'
+MUTUAL_GOAL_BLIND = os.environ.get('MUTUAL_GOAL_BLIND', '0') == '1'
 ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                     'outputs', 'mini_sweep')
 os.makedirs(ROOT, exist_ok=True)
@@ -49,6 +51,10 @@ for seed in SEEDS:
     ]
     if USE_BUS:
         cmd.append('--bus')
+    if RANDOMIZE_GOALS:
+        cmd.append('--randomize-goals')
+    if MUTUAL_GOAL_BLIND:
+        cmd.append('--mutual-goal-blind')
     env = {**os.environ, 'WANDB_RUN_GROUP': sweep_group}
     t0 = time.time()
     result = subprocess.run(cmd, capture_output=True, text=True, env=env)
@@ -65,6 +71,9 @@ for seed in SEEDS:
 # Aggregate
 KEYS = [
     'goal_space_coverage',
+    'goal_space_coverage_a',
+    'goal_space_coverage_b',
+    'goal_space_coverage_joint',
     'goal_vector_std',
     'entropy',
     'coverage',
@@ -73,6 +82,7 @@ KEYS = [
     'topographic_similarity',
     'comm_recon_loss',
     'comm_ablation_delta',
+    'comm_ablation_delta_scramble',
     'temporal_extent',
     'eval_success_rate',
     'final_return_mean',

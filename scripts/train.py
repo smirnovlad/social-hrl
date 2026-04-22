@@ -342,6 +342,9 @@ def main():
 
     # Save returns for plotting
     np.save(os.path.join(output_dir, 'returns.npy'), np.array(results['returns']))
+    if results.get('history') is not None:
+        with open(os.path.join(output_dir, 'history.json'), 'w') as f:
+            json.dump(results['history'], f, indent=2, default=float)
     run_metadata['output_dir'] = output_dir
     write_json(os.path.join(output_dir, 'run_info.json'), run_metadata)
 

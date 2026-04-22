@@ -34,6 +34,8 @@ SCENARIOS = {
 MODES = os.environ.get('MODES', 'discrete social').split()
 SEEDS = [int(s) for s in os.environ.get('SEEDS', '42').split()]
 TIMESTEPS = int(os.environ.get('TIMESTEPS', '12000'))
+RANDOMIZE_GOALS = os.environ.get('RANDOMIZE_GOALS', '0') == '1'
+MUTUAL_GOAL_BLIND = os.environ.get('MUTUAL_GOAL_BLIND', '0') == '1'
 ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                     'outputs', 'rq4_scenarios')
 os.makedirs(ROOT, exist_ok=True)
@@ -66,6 +68,10 @@ for scen_name, scen_cfg in SCENARIOS.items():
             cmd += ['--bus-window', str(scen_cfg['bus_window'])]
         if scen_cfg['turn_taking']:
             cmd.append('--turn-taking')
+        if RANDOMIZE_GOALS:
+            cmd.append('--randomize-goals')
+        if MUTUAL_GOAL_BLIND:
+            cmd.append('--mutual-goal-blind')
         env = {**os.environ,
                'WANDB_RUN_GROUP': sweep_group,
                'WANDB_TAGS': f'rq4,{scen_name}'}
@@ -85,10 +91,14 @@ for scen_name, scen_cfg in SCENARIOS.items():
 
 KEYS = [
     'goal_space_coverage',
+    'goal_space_coverage_a',
+    'goal_space_coverage_b',
+    'goal_space_coverage_joint',
     'goal_vector_std',
     'listener_accuracy',
     'topographic_similarity',
     'comm_ablation_delta',
+    'comm_ablation_delta_scramble',
     'final_return_mean',
 ]
 
@@ -115,11 +125,15 @@ print(f'RQ4 SCENARIO RESULTS (seeds={SEEDS}, {TIMESTEPS} timesteps)')
 print('=' * 120)
 header = f'{"scenario":<14}{"mode":<10}'
 for k in KEYS:
-    short = k.replace('goal_space_coverage', 'gs_cov') \
+    short = k.replace('goal_space_coverage_joint', 'gs_joint') \
+             .replace('goal_space_coverage_a', 'gs_a') \
+             .replace('goal_space_coverage_b', 'gs_b') \
+             .replace('goal_space_coverage', 'gs_cov') \
              .replace('goal_vector_std', 'gv_std') \
              .replace('listener_accuracy', 'listener') \
              .replace('topographic_similarity', 'topsim') \
-             .replace('comm_ablation_delta', 'abl_d') \
+             .replace('comm_ablation_delta_scramble', 'abl_scr') \
+             .replace('comm_ablation_delta', 'abl_z') \
              .replace('final_return_mean', 'ret')
     header += f'{short:>16}'
 print(header)
@@ -143,25 +157,32 @@ print('=' * 120)
 
 # RQ4 verdict: which scenario produces the largest social-over-discrete lift?
 print()
-print('RQ4 verdict (social - discrete gap per scenario):')
+print('RQ4 verdict per scenario:')
+print('  pooled_gap  : social - discrete on legacy pooled goal_space_coverage')
+print('  joint       : social joint goal_space_coverage (preferred collapse metric)')
+print('  abl_scr     : social comm_ablation_delta_scramble (preferred channel test)')
 print('-' * 78)
 for scen_name in SCENARIOS:
     dv = agg[scen_name]['discrete'].get('goal_space_coverage', [])
     sv = agg[scen_name]['social'].get('goal_space_coverage', [])
-    if not dv or not sv:
-        print(f'  {scen_name:<14}: missing data')
-        continue
-    gap_cov = np.mean(sv) - np.mean(dv)
-    abl = agg[scen_name]['social'].get('comm_ablation_delta', [])
-    abl_str = f'abl_delta={np.mean(abl):+.3f}' if abl else 'abl_delta=n/a'
+    gap_str = 'pooled_gap=n/a'
+    if dv and sv:
+        gap_cov = np.mean(sv) - np.mean(dv)
+        gap_str = f'pooled_gap={gap_cov:+.3f}'
+    joint = agg[scen_name]['social'].get('goal_space_coverage_joint', [])
+    joint_str = f'joint={np.mean(joint):.3f}' if joint else 'joint=n/a'
+    abl_scr = agg[scen_name]['social'].get('comm_ablation_delta_scramble', [])
+    abl_scr_str = f'abl_scr={np.mean(abl_scr):+.3f}' if abl_scr else 'abl_scr=n/a'
+    abl_z = agg[scen_name]['social'].get('comm_ablation_delta', [])
+    abl_z_str = f'abl_z={np.mean(abl_z):+.3f}' if abl_z else 'abl_z=n/a'
     lis = agg[scen_name]['social'].get('listener_accuracy', [])
     lis_str = f'listener={np.mean(lis):.3f}' if lis else 'listener=n/a'
-    print(f'  {scen_name:<14}: coverage_gap(social-discrete)={gap_cov:+.3f}  '
-          f'{abl_str}   {lis_str}')
+    print(f'  {scen_name:<14}: {gap_str}  {joint_str}  '
+          f'{abl_scr_str}  {abl_z_str}  {lis_str}')
 print('-' * 78)
-print('Interpretation: a scenario "regularizes more" if social closes the '
-      'coverage gap (less negative / more positive) AND comm_ablation_delta '
-      'rises (channel carries load-bearing info).')
+print('Interpretation: a scenario regularizes more if (social joint coverage '
+      'is high) AND (abl_scr is positive -- scrambled partner messages hurt '
+      'return, meaning channel carries partner-specific causal info).')
 
 summary_path = os.path.join(ROOT, TS, 'aggregated_summary.json')
 with open(summary_path, 'w') as f:

@@ -101,6 +101,14 @@ class TransferTrainer:
             encoder_sd = _extract_agent_state_dict(state['encoders'], agent_idx=0)
             manager_sd = _extract_agent_state_dict(state['managers'], agent_idx=0)
             comm_sd = _extract_agent_state_dict(state['comm_channels'], agent_idx=0)
+            # Partner-message bank captured during source-training final eval.
+            # Sampled in _select_goal() so the frozen social manager sees an
+            # in-distribution partner message instead of a zero vector.
+            bank = state.get('partner_msg_bank')
+            if bank is not None and bank[1] is not None:
+                self._partner_msg_bank = bank[1].to(self.device)
+            else:
+                self._partner_msg_bank = None
 
             self.encoder = MinigridEncoder(
                 obs_shape, channels=tuple(config['encoder']['channels']),
@@ -194,15 +202,22 @@ class TransferTrainer:
 
     def _select_goal(self, features):
         if self._social_source:
-            zero_msg = torch.zeros(
-                features.shape[0], self._goal_dim, device=features.device
-            )
-            _, _, _, goal_mean = self.manager(features, received_message=zero_msg)
+            B = features.shape[0]
+            if self._partner_msg_bank is not None and len(self._partner_msg_bank) > 0:
+                idx = torch.randint(
+                    0, len(self._partner_msg_bank), (B,),
+                    device=features.device,
+                )
+                sampled = self._partner_msg_bank[idx]
+                p_embed = self.comm_channel.embed_message(sampled)
+            else:
+                p_embed = torch.zeros(B, self._goal_dim, device=features.device)
+            _, _, _, goal_mean = self.manager(features, received_message=p_embed)
         else:
             h = self.manager.policy(features)
             goal_mean = self.manager.goal_mean(h)
-        msg_onehot, _, _ = self.comm_channel.encode(goal_mean)
-        return self.comm_channel.decode(msg_onehot)
+        msg_onehot, _ = self.comm_channel.encode_deterministic(goal_mean)
+        return F.normalize(self.comm_channel.decode(msg_onehot), dim=-1)
 
     def _select_worker_action(self, features, goal):
         logits = self.worker.policy(torch.cat([features, goal], dim=-1))
@@ -351,6 +366,7 @@ class TransferTrainer:
             steps_since_goal = 0
             done = False
             ep_return = 0.0
+            success = False
 
             while not done:
                 with torch.no_grad():
@@ -359,15 +375,16 @@ class TransferTrainer:
                         current_goal = self._select_goal(features)
                     action = self._select_worker_action(features, current_goal)
 
-                next_obs, reward, terminated, truncated, _ = env.step(action.item())
+                next_obs, reward, terminated, truncated, info = env.step(action.item())
                 done = terminated or truncated
                 ep_return += reward
+                success = success or bool(info.get('success', False))
                 obs_t = torch.from_numpy(next_obs).unsqueeze(0).to(self.device)
                 steps_since_goal += 1
 
             env.close()
             returns.append(ep_return)
-            successes.append(float(ep_return > 0.0))
+            successes.append(float(success))
 
         return {
             'mean_return': float(np.mean(returns)) if returns else 0.0,
@@ -379,6 +396,7 @@ class TransferTrainer:
         """Run the transfer training loop."""
         num_updates = self.total_timesteps // (self.num_steps * self.num_envs)
         all_returns = []
+        history = []
 
         freeze_str = []
         if self.freeze_encoder:
@@ -397,6 +415,12 @@ class TransferTrainer:
 
             if update % 10 == 0:
                 recent = all_returns[-50:] if all_returns else [0]
+                history.append({
+                    'update': update,
+                    'global_step': self.global_step,
+                    'mean_return': float(np.mean(recent)),
+                    'episodes': len(all_returns),
+                })
                 print(
                     f"  Update {update}/{num_updates} | Step {self.global_step} | "
                     f"Return: {np.mean(recent):.4f} | Episodes: {len(all_returns)}"
@@ -421,6 +445,7 @@ class TransferTrainer:
             'freeze_encoder': self.freeze_encoder,
             'freeze_manager': self.freeze_manager,
             'freeze_comm': self.freeze_comm,
+            'history': history,
         }
 
 

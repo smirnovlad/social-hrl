@@ -2,7 +2,8 @@
 
 Metrics:
 - Goal entropy: diversity of goals used
-- Goal coverage: fraction of distinct goals per episode
+- Goal coverage: fraction of the discrete vocabulary that was observed
+- Message novelty: fraction of messages that were unique in the sample
 - Temporal extent: average duration of each subgoal
 - Message usage stats (for discrete mode)
 - Topographic similarity: correlation between message distance and state distance
@@ -36,13 +37,13 @@ def goal_entropy(messages):
     return entropy
 
 
-def goal_coverage(messages):
-    """Fraction of unique messages out of total messages.
+def message_novelty(messages):
+    """Fraction of sampled messages that were unique.
 
     Args:
         messages: List of numpy arrays.
     Returns:
-        coverage: Float in [0, 1]. 1.0 = every message is unique.
+        novelty: Float in [0, 1]. 1.0 = every sampled message was unique.
     """
     if not messages:
         return 0.0
@@ -52,6 +53,25 @@ def goal_coverage(messages):
     total = len(msg_tuples)
 
     return unique / total
+
+
+def goal_coverage(messages, vocab_size=10, message_length=3):
+    """Fraction of the discrete vocabulary that was observed.
+
+    Args:
+        messages: List of numpy arrays.
+        vocab_size: K - number of symbols per token.
+        message_length: L - number of token positions.
+    Returns:
+        coverage: Float in [0, 1]. 1.0 = every possible message was used.
+    """
+    if not messages:
+        return 0.0
+
+    msg_tuples = [tuple(m) for m in messages]
+    unique = len(set(msg_tuples))
+    total_vocab = vocab_size ** message_length
+    return unique / total_vocab
 
 
 def temporal_extent(goals, threshold=0.1):
@@ -111,7 +131,8 @@ def message_usage_stats(messages, vocab_size=10, message_length=3):
         'total_messages': len(messages),
         'unique_messages': len(set(tuple(m) for m in messages)),
         'entropy': goal_entropy(messages),
-        'coverage': goal_coverage(messages),
+        'coverage': goal_coverage(messages, vocab_size, message_length),
+        'message_novelty': message_novelty(messages),
     }
 
     # Per-position entropy
@@ -356,8 +377,50 @@ def goal_vector_std(goals):
     return float(goals.std(axis=0).mean())
 
 
+def joint_goal_space_coverage(goals_a, goals_b, n_bins_per_dim=4, max_dims=2):
+    """Coverage of the joint (goal_a, goal_b) space for two agents.
+
+    The single-agent `goal_space_coverage` can look healthy even when both
+    agents collapse to the *same* goal region; this metric detects that case
+    by requiring diversity across the pair. Each agent's goals are binned
+    over their first `max_dims` dims (default 2 so the joint cell count stays
+    tractable: 4^2 * 4^2 = 256 cells); coverage is fraction of joint cells
+    that see at least one (a, b) pair. Assumes goals_a[i] and goals_b[i]
+    co-occur (same env/step emission).
+    """
+    goals_a = np.asarray(goals_a)
+    goals_b = np.asarray(goals_b)
+    if goals_a.ndim != 2 or goals_b.ndim != 2:
+        return 0.0
+    n = min(len(goals_a), len(goals_b))
+    if n < 2:
+        return 0.0
+    goals_a, goals_b = goals_a[:n], goals_b[:n]
+
+    def _bin(goals):
+        d = min(max_dims, goals.shape[1])
+        cells = np.zeros(len(goals), dtype=np.int64)
+        for dim in range(d):
+            col = goals[:, dim]
+            qs = np.linspace(0, 1, n_bins_per_dim + 1)
+            edges = np.quantile(col, qs)
+            edges[0] -= 1e-6
+            edges[-1] += 1e-6
+            idx = np.digitize(col, edges) - 1
+            idx = np.clip(idx, 0, n_bins_per_dim - 1)
+            cells = cells * n_bins_per_dim + idx
+        return cells, n_bins_per_dim ** d
+
+    cells_a, total_a = _bin(goals_a)
+    cells_b, total_b = _bin(goals_b)
+    joint = cells_a * total_b + cells_b
+    occupied = len(np.unique(joint))
+    return float(occupied) / float(total_a * total_b)
+
+
 def compute_all_metrics(messages=None, continuous_goals=None, vocab_size=10,
-                        message_length=3, states=None, decoded_goals=None):
+                        message_length=3, states=None, decoded_goals=None,
+                        decoded_goals_per_agent=None):
     """Compute all available goal quality metrics.
 
     Args:
@@ -376,7 +439,8 @@ def compute_all_metrics(messages=None, continuous_goals=None, vocab_size=10,
 
     if messages:
         metrics['entropy'] = goal_entropy(messages)
-        metrics['coverage'] = goal_coverage(messages)
+        metrics['coverage'] = goal_coverage(messages, vocab_size, message_length)
+        metrics['message_novelty'] = message_novelty(messages)
         metrics['temporal_extent'] = temporal_extent(np.array(messages))
         metrics.update(message_usage_stats(messages, vocab_size, message_length))
 
@@ -413,5 +477,22 @@ def compute_all_metrics(messages=None, continuous_goals=None, vocab_size=10,
         if decoded_goals.ndim == 2 and len(decoded_goals) >= 2:
             metrics['goal_space_coverage'] = goal_space_coverage(decoded_goals)
             metrics['goal_vector_std'] = goal_vector_std(decoded_goals)
+
+    if decoded_goals_per_agent is not None:
+        per_agent = []
+        for a, g in enumerate(decoded_goals_per_agent):
+            if g is None:
+                continue
+            g = np.asarray(g)
+            if g.ndim != 2 or len(g) < 2:
+                continue
+            tag = 'a' if a == 0 else 'b'
+            metrics[f'goal_space_coverage_{tag}'] = goal_space_coverage(g)
+            metrics[f'goal_vector_std_{tag}'] = goal_vector_std(g)
+            per_agent.append(g)
+        if len(per_agent) == 2:
+            metrics['goal_space_coverage_joint'] = joint_goal_space_coverage(
+                per_agent[0], per_agent[1]
+            )
 
     return metrics

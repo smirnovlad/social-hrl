@@ -155,7 +155,7 @@ def plot_goal_metrics(runs, output_path):
     """Plot goal quality metrics comparison as bar charts."""
     grouped = group_runs(runs)
     metric_names = ['entropy', 'coverage', 'temporal_extent']
-    metric_labels = ['Goal Entropy', 'Goal Coverage', 'Temporal Extent']
+    metric_labels = ['Goal Entropy', 'Message Vocab Coverage', 'Temporal Extent']
     fig, axes = plt.subplots(1, 3, figsize=(max(15, len(grouped) * 2.8), 5))
     colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
 
@@ -269,8 +269,8 @@ def generate_summary_table(runs, output_path):
 
     with open(output_path, 'w') as f:
         f.write("# Results Summary\n\n")
-        f.write("| Condition | Seeds | Final Return (mean±std) | Success Rate | Goal Entropy | Coverage |\n")
-        f.write("|-----------|-------|-------------------------|--------------|--------------|----------|\n")
+        f.write("| Condition | Seeds | Final Return (mean±std) | Success Rate | Goal Entropy | Message Coverage |\n")
+        f.write("|-----------|-------|-------------------------|--------------|--------------|------------------|\n")
         for row in rows:
             f.write(
                 f"| {row['condition']} | {row['seeds']} | "

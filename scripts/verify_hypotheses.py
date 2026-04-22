@@ -107,7 +107,8 @@ MULTI_AGENT_MODES = {'social', 'lola', 'maddpg'}
 def build_config(total_timesteps, corridor_size, mode, seed, corridor_width=3,
                  listener_reward_coef=0.0, bus_cost_solo=0.0,
                  bus_cost_shared=0.0, vocab_size=10, message_length=3,
-                 bus_window=0, turn_taking=False):
+                 bus_window=0, turn_taking=False, randomize_goals=False,
+                 mutual_goal_blind=False):
     """Minimal config for a fast corridor run."""
     goal_period = 8
     num_envs = 4
@@ -126,6 +127,8 @@ def build_config(total_timesteps, corridor_size, mode, seed, corridor_width=3,
             'bus_cost_shared': bus_cost_shared if mode in MULTI_AGENT_MODES else 0.0,
             'bus_window': bus_window if mode in MULTI_AGENT_MODES else 0,
             'turn_taking': turn_taking if mode in MULTI_AGENT_MODES else False,
+            'randomize_goals': randomize_goals,
+            'mutual_goal_blind': mutual_goal_blind if mode in MULTI_AGENT_MODES else False,
         },
         'encoder': {'channels': [16, 32, 64], 'hidden_dim': 64},
         'manager': {
@@ -139,18 +142,29 @@ def build_config(total_timesteps, corridor_size, mode, seed, corridor_width=3,
             'hidden_dim': 64,
             'intrinsic_reward_coef': 0.1,
             'extrinsic_reward_coef': 1.0,
-            'intrinsic_anneal': False,
-            'intrinsic_anneal_steps': 500_000,
+            # Anneal intrinsic reward to zero across the full run. Early on
+            # the worker needs goal-following signal; late in training an
+            # always-on intrinsic term pulls the manager toward goals that
+            # produce reachable waypoints regardless of extrinsic return, a
+            # known failure mode that flattens goal diversity. Schedule runs
+            # over the full budget so coef -> 0 as extrinsic reward dominates.
+            'intrinsic_anneal': True,
+            'intrinsic_anneal_steps': max(total_timesteps, 10_000),
             'intrinsic_warmup_steps': 0,
         },
         'communication': {
             'vocab_size': vocab_size,
             'message_length': message_length,
             'tau_start': 1.0,
-            'tau_end': 0.3,
+            # tau_end was 0.3 -- still soft enough that the Gumbel-Softmax
+            # output is a smooth mixture, not a near-one-hot code. That makes
+            # the "discrete bottleneck" act more like a low-entropy continuous
+            # channel, which undermines both the discrete baseline and the
+            # social-vs-discrete comparison. 0.1 is the standard near-hard
+            # setting used in most emergent-comm work.
+            'tau_end': 0.1,
             # Anneal tau across ~80% of training so the codebook stabilizes
-            # before the bottleneck hardens. At 15k this was pre-annealing
-            # (1.0 -> 0.3 over 7.5k) before the channel had converged.
+            # before the bottleneck hardens.
             'tau_anneal_steps': max(int(total_timesteps * 0.8), 10_000),
             'listener_reward_coef': 0.0,
             'ablation_mode': (mode in SOCIAL_MODES),
@@ -215,7 +229,8 @@ def run_mode(mode, total_timesteps, corridor_size, seed, out_dir, device,
              corridor_width=3, listener_reward_coef=0.0,
              bus_cost_solo=0.0, bus_cost_shared=0.0,
              vocab_size=10, message_length=3,
-             bus_window=0, turn_taking=False):
+             bus_window=0, turn_taking=False, randomize_goals=False,
+             mutual_goal_blind=False):
     """Run one mode end-to-end and return a dict of metrics."""
     os.makedirs(out_dir, exist_ok=True)
     seed_all(seed)
@@ -227,7 +242,9 @@ def run_mode(mode, total_timesteps, corridor_size, seed, out_dir, device,
                        vocab_size=vocab_size,
                        message_length=message_length,
                        bus_window=bus_window,
-                       turn_taking=turn_taking)
+                       turn_taking=turn_taking,
+                       randomize_goals=randomize_goals,
+                       mutual_goal_blind=mutual_goal_blind)
     t0 = time.time()
 
     if mode == 'social':
@@ -271,6 +288,7 @@ def run_mode(mode, total_timesteps, corridor_size, seed, out_dir, device,
         message_length=cfg['communication']['message_length'],
         states=all_states if all_states else None,
         decoded_goals=results.get('decoded_goals'),
+        decoded_goals_per_agent=results.get('decoded_goals_per_agent'),
     )
     # Replace the flat-messages-based temporal_extent (which is measured across
     # interleaved per-env messages and reports ~1 regardless of behavior) with
@@ -288,6 +306,9 @@ def run_mode(mode, total_timesteps, corridor_size, seed, out_dir, device,
         metrics['eval_with_comm'] = ce['with_comm']['mean_return']
         metrics['eval_without_comm'] = ce['without_comm']['mean_return']
         metrics['comm_ablation_delta'] = ce['delta']
+        if 'scrambled' in ce:
+            metrics['eval_scrambled'] = ce['scrambled']['mean_return']
+            metrics['comm_ablation_delta_scramble'] = ce['delta_scramble']
     if results.get('recon_loss_mean') is not None:
         metrics['comm_recon_loss'] = results['recon_loss_mean']
     metrics['final_return_mean'] = (
@@ -296,6 +317,11 @@ def run_mode(mode, total_timesteps, corridor_size, seed, out_dir, device,
 
     with open(os.path.join(out_dir, f'{mode}_metrics.json'), 'w') as f:
         json.dump(metrics, f, indent=2, default=float)
+    if results.get('returns') is not None:
+        np.save(os.path.join(out_dir, 'returns.npy'), np.array(results['returns']))
+    if results.get('history') is not None:
+        with open(os.path.join(out_dir, 'history.json'), 'w') as f:
+            json.dump(results['history'], f, indent=2, default=float)
 
     if wandb_run is not None:
         for k, v in metrics.items():
@@ -320,15 +346,19 @@ def verdict_table(all_metrics):
         ('final_return_mean',      'final_return_mean'),
         ('eval_success_rate',      'eval_success_rate'),
         ('goal_space_coverage',    'goal_space_coverage'),  # collapse signal (goal space)
+        ('  coverage agent A',     'goal_space_coverage_a'),
+        ('  coverage agent B',     'goal_space_coverage_b'),
+        ('  coverage joint',       'goal_space_coverage_joint'),
         ('goal_vector_std',        'goal_vector_std'),      # collapse signal (amplitude)
         ('message entropy',        'entropy'),              # collapse signal (message space)
-        ('message coverage',       'coverage'),
+        ('msg vocab coverage',    'coverage'),
         ('temporal_extent',        'temporal_extent'),
         ('mutual_information',     'mutual_information'),
         ('listener_accuracy',      'listener_accuracy'),
         ('topographic_similarity', 'topographic_similarity'),
         ('comm_recon_loss',        'comm_recon_loss'),
         ('comm_ablation_delta',    'comm_ablation_delta'),
+        ('  delta (scramble)',     'comm_ablation_delta_scramble'),
     ]
     modes = [m['mode'] for m in all_metrics]
     print()
@@ -452,6 +482,14 @@ def main():
     ap.add_argument('--turn-taking', action='store_true',
                     help='Only one agent acts per step (alternating). '
                          'Forces sequential coordination (RQ4).')
+    ap.add_argument('--randomize-goals', action='store_true',
+                    help='Resample goal positions every episode. Makes the '
+                         "partner's goal location episode-dependent so the "
+                         'comm channel has something non-trivial to carry.')
+    ap.add_argument('--mutual-goal-blind', action='store_true',
+                    help='Each agent sees the partner goal but not its own '
+                         'goal, so the only path to knowing where to go is '
+                         "the partner's message. Pairs with --randomize-goals.")
     args = ap.parse_args()
 
     if args.quick:
@@ -494,7 +532,9 @@ def main():
                          vocab_size=args.vocab_size,
                          message_length=args.message_length,
                          bus_window=args.bus_window,
-                         turn_taking=args.turn_taking)
+                         turn_taking=args.turn_taking,
+                         randomize_goals=args.randomize_goals,
+                         mutual_goal_blind=args.mutual_goal_blind)
         except Exception as e:
             import traceback; traceback.print_exc()
             print(f'[verify] {mode} FAILED: {e}')

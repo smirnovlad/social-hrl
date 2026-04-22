@@ -3,7 +3,11 @@ import unittest
 import numpy as np
 from minigrid.core.constants import OBJECT_TO_IDX
 
-from envs.multi_agent_env import TwoAgentCorridorEnv, make_corridor_vec_env
+from envs.multi_agent_env import (
+    SingleAgentCorridorEnv,
+    TwoAgentCorridorEnv,
+    make_corridor_vec_env,
+)
 
 
 class CorridorEnvTests(unittest.TestCase):
@@ -58,6 +62,37 @@ class CorridorEnvTests(unittest.TestCase):
         finally:
             env_a.close()
             env_b.close()
+
+    def test_turn_taking_uses_true_noop_for_inactive_agent(self):
+        env = TwoAgentCorridorEnv(turn_taking=True)
+        try:
+            env.reset(seed=7)
+            initial_dir = env.agent_dirs[1]
+            initial_pos = env.agent_positions[1]
+
+            env.step((2, 1))
+
+            self.assertEqual(env.agent_dirs[1], initial_dir)
+            self.assertEqual(env.agent_positions[1], initial_pos)
+        finally:
+            env.close()
+
+    def test_single_agent_corridor_reports_success_in_info(self):
+        env = SingleAgentCorridorEnv()
+        try:
+            env.reset(seed=11)
+            goal_x, goal_y = env.env.goal_positions[0]
+            env.env.agent_positions[0] = (goal_x - 1, goal_y)
+            env.env.agent_dirs[0] = 0  # face right toward the goal
+
+            _, reward, terminated, truncated, info = env.step(2)
+
+            self.assertTrue(terminated)
+            self.assertFalse(truncated)
+            self.assertTrue(info["success"])
+            self.assertGreater(reward, 0.0)
+        finally:
+            env.close()
 
 
 if __name__ == "__main__":

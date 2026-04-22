@@ -223,6 +223,8 @@ def fig3_transfer(json_path: str):
         return
     with open(json_path) as f:
         d = json.load(f)
+    if isinstance(d, dict) and 'aggregate' in d:
+        d = d['aggregate']
     sources = []
     means = []
     stds = []

@@ -31,13 +31,26 @@ class TwoAgentCorridorEnv(MiniGridEnv):
                  corridor_width=3, asymmetric_info=False,
                  rendezvous_bonus=0.0, num_obstacles=0,
                  bus_cost_solo=0.0, bus_cost_shared=0.0,
-                 bus_window=0, turn_taking=False, **kwargs):
+                 bus_window=0, turn_taking=False,
+                 randomize_goals=False, mutual_goal_blind=False, **kwargs):
         self.corridor_length = corridor_length
         self._size = size
         self.corridor_width = corridor_width
         self.asymmetric_info = asymmetric_info
         self.rendezvous_bonus = rendezvous_bonus
         self.num_obstacles = num_obstacles
+        # Per-episode randomization of goal tiles. When False, goals sit at the
+        # fixed positions that gave the old "two agents can solve it
+        # independently" setup; when True, each agent's goal is resampled in
+        # the opposite room every reset, so the partner's goal location becomes
+        # episode-dependent information.
+        self.randomize_goals = randomize_goals
+        # Hard information asymmetry: each agent's partial view has its OWN
+        # goal tile masked, but the partner's goal tile remains visible. With
+        # randomize_goals=True this makes the partner's message the only path
+        # to learning where you need to navigate, so the comm channel is
+        # forced to carry non-trivial coordination information.
+        self.mutual_goal_blind = mutual_goal_blind
         # Shared-bus resource: being in the corridor alone costs `bus_cost_solo`
         # per step; both-agents-in-corridor costs `bus_cost_shared` (typically 0
         # or small). Cheaper-per-agent-when-simultaneous => coordination pressure.
@@ -102,13 +115,40 @@ class TwoAgentCorridorEnv(MiniGridEnv):
         self.agent_positions[1] = (width - 3, height - 3)
         self.agent_dirs[1] = 2
 
-        # Goal for A is in B's starting area
-        gx_a, gy_a = width - 3, height - 4
+        # Goal placement. With randomize_goals=False we preserve the fixed
+        # layout the earlier sweeps were trained on. With True we sample each
+        # agent's goal uniformly from interior tiles on the partner's side of
+        # the corridor, skipping walls, the corridor zone, and the two agent
+        # start tiles.
+        if self.randomize_goals:
+            half = self.corridor_width // 2
+            def _sample_goal(x_lo, x_hi):
+                for _ in range(200):
+                    gx = self._rand_int(x_lo, x_hi)
+                    gy = self._rand_int(1, height - 1)
+                    if (gx, gy) == tuple(self.agent_positions[0]):
+                        continue
+                    if (gx, gy) == tuple(self.agent_positions[1]):
+                        continue
+                    if corridor_start <= gx < corridor_end and \
+                            mid_y - half <= gy <= mid_y + half:
+                        continue
+                    if self.grid.get(gx, gy) is not None:
+                        continue
+                    return gx, gy
+                # Fall back to the deterministic tile if sampling fails.
+                return None
+
+            picked_a = _sample_goal(corridor_end, width - 1)
+            gx_a, gy_a = picked_a if picked_a is not None else (width - 3, height - 4)
+            picked_b = _sample_goal(1, corridor_start)
+            gx_b, gy_b = picked_b if picked_b is not None else (2, 3)
+        else:
+            gx_a, gy_a = width - 3, height - 4
+            gx_b, gy_b = 2, 3
+
         self.grid.set(gx_a, gy_a, Goal())
         self.goal_positions[0] = (gx_a, gy_a)
-
-        # Goal for B is in A's starting area
-        gx_b, gy_b = 2, 3
         self.grid.set(gx_b, gy_b, Goal())
         self.goal_positions[1] = (gx_b, gy_b)
 
@@ -156,7 +196,21 @@ class TwoAgentCorridorEnv(MiniGridEnv):
         self.agent_pos = np.array(self.agent_positions[agent_idx])
         self.agent_dir = self.agent_dirs[agent_idx]
 
+        # Under mutual_goal_blind, temporarily remove *this* agent's own goal
+        # tile from the grid so gen_obs renders a view with only the partner's
+        # goal visible. The partner's message is then the only source of the
+        # agent's own goal location.
+        swapped_own_goal = None
+        if self.mutual_goal_blind and self.goal_positions[agent_idx] is not None:
+            ogx, ogy = self.goal_positions[agent_idx]
+            swapped_own_goal = (ogx, ogy, self.grid.get(ogx, ogy))
+            self.grid.set(ogx, ogy, None)
+
         obs = self.gen_obs()
+
+        if swapped_own_goal is not None:
+            ogx, ogy, orig = swapped_own_goal
+            self.grid.set(ogx, ogy, orig)
 
         self.agent_pos = old_pos
         self.agent_dir = old_dir
@@ -204,7 +258,11 @@ class TwoAgentCorridorEnv(MiniGridEnv):
 
         reward = -0.01  # Small step penalty
 
-        if action == 0:  # Turn left
+        if action is None:
+            # True no-op for turn-taking: time advances, but orientation and
+            # position do not change.
+            pass
+        elif action == 0:  # Turn left
             self.agent_dirs[agent_idx] = (dir_ - 1) % 4
         elif action == 1:  # Turn right
             self.agent_dirs[agent_idx] = (dir_ + 1) % 4
@@ -250,17 +308,17 @@ class TwoAgentCorridorEnv(MiniGridEnv):
         self.step_count += 1
 
         # Turn-taking: only one agent acts per global step (alternating).
-        # The other agent's action is replaced with a no-op-equivalent
-        # (turn-left rotates direction but leaves position unchanged).
+        # The other agent receives a true no-op so its orientation does not
+        # drift while it waits.
         if self.turn_taking:
             active = (self.step_count - 1) % 2
-            actions = list(actions)
-            actions[1 - active] = 0  # turn left (position unchanged)
-            actions = tuple(actions)
+            effective_actions = [None, None]
+            effective_actions[active] = actions[active]
             order = [active, 1 - active]
         else:
             # Randomly decide who moves first to avoid bias
             order = [0, 1] if self.np_random.random() > 0.5 else [1, 0]
+            effective_actions = actions
 
         # Capture pre-step done state for coordination bonus detection
         prev_both_done = all(self.agent_dones)
@@ -270,7 +328,7 @@ class TwoAgentCorridorEnv(MiniGridEnv):
         done_list = [False, False]
 
         for idx in order:
-            obs, rew, done = self.step_agent(idx, actions[idx])
+            obs, rew, done = self.step_agent(idx, effective_actions[idx])
             obs_list[idx] = obs
             reward_list[idx] = rew
             done_list[idx] = done
@@ -323,8 +381,10 @@ class TwoAgentCorridorEnv(MiniGridEnv):
 
         info = {
             'agent_dones': done_list,
+            'agent_successes': list(self.agent_dones),
             'agent_positions': list(self.agent_positions),
             'both_in_corridor': both_in_corridor,
+            'success': all(self.agent_dones),
         }
 
         return tuple(obs_list), tuple(reward_list), terminated, truncated, info
@@ -338,10 +398,12 @@ class SingleAgentCorridorEnv(gym.Wrapper):
     Returns gym-compatible (obs, reward, terminated, truncated, info).
     """
 
-    def __init__(self, size=11, corridor_length=3, max_steps=200, corridor_width=3):
+    def __init__(self, size=11, corridor_length=3, max_steps=200, corridor_width=3,
+                 randomize_goals=False):
         env = TwoAgentCorridorEnv(
             size=size, corridor_length=corridor_length, max_steps=max_steps,
             corridor_width=corridor_width,
+            randomize_goals=randomize_goals,
         )
         super().__init__(env)
         self.observation_space = env.observation_space['image']
@@ -351,14 +413,17 @@ class SingleAgentCorridorEnv(gym.Wrapper):
         return obs_a, info
 
     def step(self, action):
-        # Step agent A only, agent B is frozen (action=0 = turn left = effectively idle)
-        (obs_a, _), (rew_a, _), _terminated, truncated, info = self.env.step((action, 0))
+        # Step agent A only; agent B receives a true no-op inside the env.
+        (obs_a, _), (rew_a, _), _terminated, truncated, info = self.env.step((action, None))
         agent_a_done = self.env.agent_dones[0]
+        info = dict(info)
+        info['success'] = bool(agent_a_done)
         return obs_a, rew_a, agent_a_done, truncated, info
 
 
 def make_corridor_vec_env(num_envs, seed=0, max_steps=200, single_agent=True,
-                          corridor_width=3, corridor_size=11):
+                          corridor_width=3, corridor_size=11,
+                          randomize_goals=False):
     """Create vectorized corridor environments.
 
     Args:
@@ -367,12 +432,15 @@ def make_corridor_vec_env(num_envs, seed=0, max_steps=200, single_agent=True,
         max_steps: Max steps per episode.
         single_agent: If True, single-agent version for discrete mode comparison.
         corridor_width: Width of the corridor passage (1=narrow, 3=wide).
+        randomize_goals: Resample goal tiles each episode instead of using the
+            fixed (2,3) / (W-3, H-4) layout.
     """
     def _make(i):
         def _init():
             env = SingleAgentCorridorEnv(
                 size=corridor_size, corridor_length=3, max_steps=max_steps,
                 corridor_width=corridor_width,
+                randomize_goals=randomize_goals,
             )
             env.reset(seed=seed + i)
             return env
@@ -392,7 +460,8 @@ class MultiAgentWrapper:
                  corridor_width=3, asymmetric_info=False,
                  rendezvous_bonus=0.0, num_obstacles=0,
                  bus_cost_solo=0.0, bus_cost_shared=0.0,
-                 bus_window=0, turn_taking=False):
+                 bus_window=0, turn_taking=False,
+                 randomize_goals=False, mutual_goal_blind=False):
         self.env = TwoAgentCorridorEnv(
             size=size,
             corridor_length=corridor_length,
@@ -405,6 +474,8 @@ class MultiAgentWrapper:
             bus_cost_shared=bus_cost_shared,
             bus_window=bus_window,
             turn_taking=turn_taking,
+            randomize_goals=randomize_goals,
+            mutual_goal_blind=mutual_goal_blind,
         )
         self.observation_space = self.env.observation_space['image']
         self.action_space = self.env.action_space
